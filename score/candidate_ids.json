@@ -1,0 +1,88 @@
+{
+  "range": [
+    30,
+    5030
+  ],
+  "total_in_range": 5001,
+  "cooldown_excluded": 34,
+  "source_filter": [
+    "augmented_math"
+  ],
+  "matched_source": 3172,
+  "scored": 8,
+  "generated_at": 1782017894,
+  "candidates": [
+    {
+      "id": 2849,
+      "score": 13.8,
+      "solution_score": 11.42,
+      "problem_score": 28.84,
+      "answer_score": 41.6,
+      "source": "augmented_math",
+      "answer": "6"
+    },
+    {
+      "id": 255,
+      "score": 13.74,
+      "solution_score": 11.31,
+      "problem_score": 28.84,
+      "answer_score": 42.39,
+      "source": "augmented_math",
+      "answer": "\\frac{7}{44}"
+    },
+    {
+      "id": 2532,
+      "score": 13.73,
+      "solution_score": 11.37,
+      "problem_score": 27.5,
+      "answer_score": 42.39,
+      "source": "augmented_math",
+      "answer": "\\frac{10}{19}"
+    },
+    {
+      "id": 470,
+      "score": 13.7,
+      "solution_score": 11.18,
+      "problem_score": 28.83,
+      "answer_score": 43.86,
+      "source": "augmented_math",
+      "answer": "25"
+    },
+    {
+      "id": 1229,
+      "score": 13.66,
+      "solution_score": 11.14,
+      "problem_score": 28.83,
+      "answer_score": 43.86,
+      "source": "augmented_math",
+      "answer": "10"
+    },
+    {
+      "id": 4682,
+      "score": 13.65,
+      "solution_score": 11.42,
+      "problem_score": 23.45,
+      "answer_score": 43.86,
+      "source": "augmented_math",
+      "answer": "60"
+    },
+    {
+      "id": 755,
+      "score": 13.64,
+      "solution_score": 11.2,
+      "problem_score": 28.84,
+      "answer_score": 42.39,
+      "source": "augmented_math",
+      "answer": "\\frac{16}{3}"
+    },
+    {
+      "id": 2933,
+      "score": 13.64,
+      "solution_score": 11.4,
+      "problem_score": 23.8,
+      "answer_score": 43.86,
+      "source": "augmented_math",
+      "answer": "90"
+    }
+  ]
+}

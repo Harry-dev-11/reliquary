@@ -17,6 +17,7 @@ import random as _random
 from reliquary.constants import (
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
+    MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     M_ROLLOUTS,
     PROMPT_RANGE_SIZE,
     T_PROTO,
@@ -246,6 +247,14 @@ class MiningEngine:
             self.env = env
         self._cooldown_per_env: dict[str, set[int]] = {n: set() for n in self.envs}
 
+        # Score-based prompt selection (OpenMath-only). The env-mix layer is
+        # removed: the miner ranks the per-window slice by feature-typicality
+        # against the live cooldown population and submits the top picks.
+        self._score_env = self.envs.get("openmathinstruct", self.env)
+        self._scored_window_key: tuple | None = None
+        self._scored_queue: list[int] = []
+        self._rng = _random.Random()
+
         # Lazy imports for heavy deps — keep module import cheap.
         from reliquary.shared.hf_compat import resolve_hidden_size
         from reliquary.protocol.grail_verifier import GRAILVerifier
@@ -270,7 +279,6 @@ class MiningEngine:
         (asyncio.CancelledError) or if env becomes fully cooldown'd.
         """
         import httpx
-        import random
 
         from reliquary.constants import M_ROLLOUTS, POLL_INTERVAL_SECONDS
         from reliquary.miner.submitter import (
@@ -293,7 +301,6 @@ class MiningEngine:
         # boundary and binds randomness to the round publishing at that
         # boundary — a value that didn't exist a few seconds earlier, so
         # nothing to pre-fetch. The miner just reads what /state reports.
-        rng = random.Random()
         results = []
         local_n = 0
         local_hash = ""
@@ -334,33 +341,33 @@ class MiningEngine:
                     await asyncio.sleep(0.1)
                     continue
 
-                # Per-env cooldown: /state's flat ``cooldown_prompts`` covers
-                # only the validator's first env, but ``prompt_idx`` is per-env,
-                # so query each env for its own set. Fall back to the base set
-                # on a fetch error rather than stall the loop.
-                for env_name in self._cooldown_per_env:
-                    try:
-                        env_state = await get_window_state_v2(
-                            url, env=env_name, client=client,
-                        )
-                        self._cooldown_per_env[env_name] = set(
-                            env_state.cooldown_prompts
-                        )
-                    except Exception:
-                        self._cooldown_per_env[env_name] = set(
-                            state.cooldown_prompts
-                        )
+                # OpenMath-only scored selection: fetch this env's own
+                # cooldown set (``prompt_idx`` is per-env), falling back to the
+                # flat base set on a fetch error rather than stall the loop.
+                env = self._score_env
+                env_name = getattr(env, "name", "openmathinstruct")
                 try:
-                    env_name, prompt_idx = pick_env_and_prompt(
-                        self.envs, self.mix, self._cooldown_per_env, rng=rng,
-                        randomness=randomness,
+                    env_state = await get_window_state_v2(
+                        url, env=env_name, client=client,
                     )
-                except RuntimeError:
-                    logger.info("all envs fully in cooldown; sleeping")
+                    cooldown_prompts = set(env_state.cooldown_prompts)
+                except Exception:
+                    cooldown_prompts = set(state.cooldown_prompts)
+                self._cooldown_per_env[env_name] = cooldown_prompts
+
+                # Layer 2 (window slice) → score-based selection → cooldown
+                # rejection, all inside _next_scored_prompt.
+                prompt_idx = self._next_scored_prompt(
+                    randomness, cooldown_prompts, state.window_n,
+                )
+                if prompt_idx is None:
+                    logger.info(
+                        "scored candidates exhausted for window %d; waiting",
+                        state.window_n,
+                    )
                     await asyncio.sleep(5)
                     continue
 
-                env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
                 generations = self._generate_m_rollouts(problem, randomness)
                 if len(generations) < M_ROLLOUTS:
@@ -425,6 +432,98 @@ class MiningEngine:
                     logger.error("submit failed: %s", exc)
 
         return results
+
+    def _next_scored_prompt(
+        self, randomness: str, cooldown_prompts: set[int], window_n: int,
+    ) -> int | None:
+        """Score-based prompt selection — the layer between the window slice
+        and cooldown rejection.
+
+        Rebuilds a ranked top-``MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW`` queue
+        once per ``(window_n, randomness)``: derives the same ``[lo, hi)``
+        slice the validator enforces, builds a calibration over the current
+        cooldown population, then ranks the in-slice non-cooldown prompts by
+        feature-typicality (``prompt_scoring.rank_candidates``). Subsequent
+        calls in the same window pop the next-best idx, skipping any that
+        entered cooldown since the queue was built. Returns ``None`` when the
+        window's scored candidates are exhausted.
+        """
+        from reliquary.miner.prompt_scoring import (
+            build_calibration, rank_candidates,
+        )
+
+        env = self._score_env
+        env_label = getattr(env, "name", "openmathinstruct")
+        key = (window_n, randomness)
+        if self._scored_window_key != key:
+            prompt_range = window_prompt_range(
+                randomness, env_label, len(env), PROMPT_RANGE_SIZE,
+            )
+            try:
+                cal = build_calibration(env, cooldown_prompts)
+                if cal["n"] == 0:
+                    # No cooldown population to score against yet (cold start).
+                    # Scoring is degenerate here — every prompt ties at 0 and
+                    # the lowest indices win, so all miners running this code
+                    # collide on the same picks. Use the reference uniform
+                    # picker until the cooldown set has signal.
+                    self._scored_queue = self._uniform_queue(
+                        prompt_range, cooldown_prompts,
+                    )
+                    logger.info(
+                        "scored selection: window=%d cold start, uniform "
+                        "fallback (%d picks)", window_n, len(self._scored_queue),
+                    )
+                else:
+                    self._scored_queue = rank_candidates(
+                        env, prompt_range, cooldown_prompts, cal,
+                        top=MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+                    )
+                    logger.info(
+                        "scored selection: window=%d ranked %d candidates "
+                        "(cal n=%d)", window_n,
+                        len(self._scored_queue), cal["n"],
+                    )
+            except Exception:
+                # A dataset read hiccup must not kill the mine loop — degrade
+                # to uniform selection for this window rather than propagate.
+                logger.exception(
+                    "scored selection failed; uniform fallback for window %d",
+                    window_n,
+                )
+                self._scored_queue = self._uniform_queue(
+                    prompt_range, cooldown_prompts,
+                )
+            self._scored_window_key = key
+
+        while self._scored_queue:
+            idx = self._scored_queue.pop(0)
+            if idx not in cooldown_prompts:
+                return idx
+        return None
+
+    def _uniform_queue(
+        self, prompt_range: tuple[int, int], cooldown_prompts: set[int],
+        k: int = MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    ) -> list[int]:
+        """Up to ``k`` distinct uniform-random in-slice, non-cooldown picks.
+
+        The reference selection strategy, used as the cold-start and
+        error-recovery fallback for the scored layer.
+        """
+        picks: list[int] = []
+        seen: set[int] = set()
+        for _ in range(k):
+            try:
+                idx = pick_prompt_idx(
+                    self._score_env, cooldown_prompts | seen,
+                    rng=self._rng, prompt_range=prompt_range,
+                )
+            except RuntimeError:
+                break
+            seen.add(idx)
+            picks.append(idx)
+        return picks
 
     def _load_checkpoint(self, local_path: str):
         """Reload both hf_model and vllm_model from *local_path*.
