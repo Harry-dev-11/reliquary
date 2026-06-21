@@ -2,9 +2,23 @@
 
 from reliquary.miner.prompt_scoring import (
     build_calibration,
+    is_frontier_signal,
     rank_candidates,
     read_records,
 )
+
+
+def test_frontier_signal_uniform_rejected():
+    assert is_frontier_signal([0, 0, 0, 0]) is False   # too hard
+    assert is_frontier_signal([1, 1, 1, 1]) is False   # too easy
+    assert is_frontier_signal([1]) is False
+    assert is_frontier_signal([]) is False
+
+
+def test_frontier_signal_mixed_selected():
+    assert is_frontier_signal([1, 1, 1, 0]) is True
+    assert is_frontier_signal([0, 1, 0, 1]) is True
+    assert is_frontier_signal([1, 0]) is True
 
 
 class _FakeDataset:

@@ -241,6 +241,18 @@ def score_record(rec: dict, cal: dict) -> float:
             + ans_s * TOTAL_W["expected_answer"])
 
 
+# ── Layer 4: frontier signal ────────────────────────────────────────────────
+def is_frontier_signal(signal) -> bool:
+    """True if a probe reward signal is *mixed* (contains both a 0 and a 1).
+
+    A uniform signal (all-0 = too hard, all-1 = too easy) predicts σ≈0, so the
+    validator would reject the full 8-rollout group with ``OUT_OF_ZONE``. The
+    Layer-4 probe uses this to skip such prompts before paying for the full
+    group + GRAIL. Example: ``1110`` → True (select); ``0000``/``1111`` → False.
+    """
+    return len(set(signal)) >= 2
+
+
 # ── the selection layer ─────────────────────────────────────────────────────
 def rank_candidates(
     env,

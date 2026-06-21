@@ -19,7 +19,6 @@ import random as _random
 from reliquary.constants import (
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
-    MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     M_ROLLOUTS,
     PROMPT_RANGE_SIZE,
     T_PROTO,
@@ -41,6 +40,18 @@ if TYPE_CHECKING:
     from reliquary.environment.base import Environment
 
 logger = logging.getLogger(__name__)
+
+# Layer-4 frontier probe: number of cheap rollouts generated to test whether a
+# scored prompt sits on the learning frontier before committing to a full
+# group + GRAIL. A uniform reward vector (all-0 / all-1) over these predicts
+# OUT_OF_ZONE, so the prompt is skipped.
+PROBE_ROLLOUTS = 4
+
+# Layer-2 scored candidate pool: how many top-ranked prompts to keep per window
+# for the probe to filter. Larger than the 8/window submission cap because the
+# Layer-4 probe rejects uniform prompts, so the pool must over-provision to
+# still yield up to 8 frontier submissions.
+SCORED_CANDIDATE_POOL = 16
 
 
 async def maybe_pull_checkpoint(
@@ -385,23 +396,32 @@ class MiningEngine:
                     cooldown_prompts = set(state.cooldown_prompts)
                 self._cooldown_per_env[env_name] = cooldown_prompts
 
-                # Layer 2 (window slice) → score-based selection → cooldown
-                # rejection, all inside _next_scored_prompt.
-                prompt_idx = self._next_scored_prompt(
-                    randomness, cooldown_prompts, state.window_n,
+                recorder = get_recorder()
+                # Layers 1-3 (slice → score → cooldown) + Layer 4 (frontier
+                # probe): pick a scored candidate whose cheap 4-rollout probe
+                # has a MIXED reward signal, so it won't fail OUT_OF_ZONE.
+                _t_gen = time.perf_counter()
+                probe_result = await self._probe_for_valid_prompt(
+                    env, randomness, cooldown_prompts, state.window_n,
                 )
-                if prompt_idx is None:
+                if probe_result is None:
                     logger.info(
-                        "scored candidates exhausted for window %d; waiting",
+                        "no frontier prompt in window %d "
+                        "(candidates uniform/exhausted); waiting",
                         state.window_n,
                     )
                     await asyncio.sleep(5)
                     continue
+                prompt_idx, problem, probe_rollouts = probe_result
 
-                problem = env.get_problem(prompt_idx)
-                recorder = get_recorder()
-                _t_gen = time.perf_counter()
-                generations = self._generate_m_rollouts(problem, randomness)
+                # Top up the probe sample to a full M_ROLLOUTS group, reusing
+                # the probe rollouts (all are identical T_PROTO samples).
+                need = M_ROLLOUTS - len(probe_rollouts)
+                extra = (
+                    self._generate_m_rollouts(problem, randomness, n=need)
+                    if need > 0 else []
+                )
+                generations = (probe_rollouts + extra)[:M_ROLLOUTS]
                 recorder.record_generation(
                     state.window_n, time.perf_counter() - _t_gen, M_ROLLOUTS,
                 )
@@ -529,6 +549,48 @@ class MiningEngine:
 
         return results
 
+    async def _probe_for_valid_prompt(
+        self, env, randomness: str, cooldown_prompts: set[int], window_n: int,
+    ):
+        """Layer 4: cheap learning-frontier pre-screen.
+
+        Pops scored candidates one at a time (Layers 1-3); for each, generates
+        ``PROBE_ROLLOUTS`` quick rollouts and computes their binary reward
+        vector. A *uniform* vector (all-0 = too hard, all-1 = too easy) means
+        σ≈0 → the validator would reject the full group with ``OUT_OF_ZONE``,
+        so the prompt is skipped. The first candidate with a *mixed* vector is
+        a frontier prompt: return ``(prompt_idx, problem, probe_rollouts)``
+        immediately, reusing the probe rollouts as part of the final group.
+        Returns ``None`` when the window's candidates are exhausted with no
+        frontier hit.
+        """
+        from reliquary.miner.prompt_scoring import is_frontier_signal
+
+        while True:
+            prompt_idx = self._next_scored_prompt(
+                randomness, cooldown_prompts, window_n,
+            )
+            if prompt_idx is None:
+                return None
+            problem = env.get_problem(prompt_idx)
+            probe = self._generate_m_rollouts(problem, randomness, n=PROBE_ROLLOUTS)
+            signal = []
+            for r in probe:
+                text = self.tokenizer.decode(r["tokens"][r["prompt_length"]:])
+                signal.append(1 if env.compute_reward(problem, text) > 0.5 else 0)
+            sig_str = "".join(str(s) for s in signal)
+            if not is_frontier_signal(signal):
+                logger.info(
+                    "Layer4 probe prompt=%d signal=%s uniform; skip (out_of_zone)",
+                    prompt_idx, sig_str,
+                )
+                continue
+            logger.info(
+                "Layer4 probe prompt=%d signal=%s frontier; select",
+                prompt_idx, sig_str,
+            )
+            return prompt_idx, problem, probe
+
     def _remember_rollout_hash(self, h: bytes) -> None:
         """Record a submitted rollout hash in the bounded LRU."""
         self._recent_rollout_hashes[h] = None
@@ -567,7 +629,7 @@ class MiningEngine:
         """Score-based prompt selection — the layer between the window slice
         and cooldown rejection.
 
-        Rebuilds a ranked top-``MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW`` queue
+        Rebuilds a ranked top-``SCORED_CANDIDATE_POOL`` queue
         once per ``(window_n, randomness)``: derives the same ``[lo, hi)``
         slice the validator enforces, builds a calibration over the current
         cooldown population, then ranks the in-slice non-cooldown prompts by
@@ -605,7 +667,7 @@ class MiningEngine:
                 else:
                     self._scored_queue = rank_candidates(
                         env, prompt_range, cooldown_prompts, cal,
-                        top=MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+                        top=SCORED_CANDIDATE_POOL,
                     )
                     logger.info(
                         "scored selection: window=%d ranked %d candidates "
@@ -632,7 +694,7 @@ class MiningEngine:
 
     def _uniform_queue(
         self, prompt_range: tuple[int, int], cooldown_prompts: set[int],
-        k: int = MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+        k: int = SCORED_CANDIDATE_POOL,
     ) -> list[int]:
         """Up to ``k`` distinct uniform-random in-slice, non-cooldown picks.
 
@@ -724,11 +786,11 @@ class MiningEngine:
         logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
 
-    def _generate_m_rollouts(self, problem, randomness) -> list[dict]:
-        """Generate M_ROLLOUTS completions at T_PROTO in one batched call.
+    def _generate_m_rollouts(self, problem, randomness, n: int = M_ROLLOUTS) -> list[dict]:
+        """Generate *n* completions at T_PROTO in one batched call (default M).
 
-        One .generate() with batch shape (M_ROLLOUTS, prompt_len) is ~5-7×
-        faster on GPU than M_ROLLOUTS serial calls — the matmul tiling
+        One .generate() with batch shape (n, prompt_len) is ~5-7×
+        faster on GPU than n serial calls — the matmul tiling
         utilizes far more of the GPU's compute. Each row samples
         independently (do_sample=True), so GRPO-group semantics are
         preserved. Each output row is truncated at its first post-prompt
@@ -736,6 +798,9 @@ class MiningEngine:
         eos_token_id) is not carried downstream — otherwise the validator's
         GRAIL forward pass would see extra EOS tokens the miner didn't
         "generate" in the usual sense.
+
+        ``n`` is parametrized so the Layer-4 frontier probe can generate a
+        cheap 4-rollout sample before committing to a full group.
         """
         import torch
 
@@ -751,7 +816,7 @@ class MiningEngine:
 
         with torch.no_grad():
             input_tensor = torch.tensor(
-                [prompt_tokens] * M_ROLLOUTS,
+                [prompt_tokens] * n,
                 device=getattr(self.vllm_model, "device", "cpu"),
             )
             attention_mask = torch.ones_like(input_tensor)
@@ -768,7 +833,7 @@ class MiningEngine:
                 generate_kwargs["eos_token_id"] = sorted(eos_ids)
             outputs = self.vllm_model.generate(input_tensor, **generate_kwargs)
         rollouts = []
-        for i in range(M_ROLLOUTS):
+        for i in range(n):
             seq = outputs[i].tolist()
             gen = seq[prompt_length:]
             first_eos = first_eos_index(gen, eos_ids)
