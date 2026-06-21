@@ -241,6 +241,18 @@ def score_record(rec: dict, cal: dict) -> float:
             + ans_s * TOTAL_W["expected_answer"])
 
 
+# ── smart pipeline: candidate ∩ window slice ────────────────────────────────
+def eligible_in_slice(candidate_ids, prompt_range) -> list[int]:
+    """Candidate ids that fall inside the per-window ``[lo, hi)`` slice.
+
+    The "smart" pipeline intersects a precomputed candidate.json id set with
+    the window slice the validator enforces, so only in-range candidates are
+    submitted (out-of-range → ``PROMPT_OUT_OF_RANGE``).
+    """
+    lo, hi = prompt_range
+    return [i for i in candidate_ids if lo <= i < hi]
+
+
 # ── Layer 4: frontier signal ────────────────────────────────────────────────
 def is_frontier_signal(signal) -> bool:
     """True if a probe reward signal is *mixed* (contains both a 0 and a 1).

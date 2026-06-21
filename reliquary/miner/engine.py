@@ -261,6 +261,8 @@ class MiningEngine:
         proof_gpu: int = 1,
         max_new_tokens: int = MAX_NEW_TOKENS_PROTOCOL_CAP,
         validator_url_override: str | None = None,
+        selection_mode: str = "score",
+        candidate_path: str | None = None,
     ) -> None:
         self.vllm_model = vllm_model
         self.hf_model = hf_model
@@ -295,6 +297,21 @@ class MiningEngine:
         # validator would reject with HASH_DUPLICATE. Bounded LRU.
         self._recent_rollout_hashes: "OrderedDict[bytes, None]" = OrderedDict()
         self._recent_rollout_cap = 4096
+
+        # --- "smart" pipeline state (selection_mode == "smart") ---------------
+        # Differs from the score pipeline only in prompt selection: pick from a
+        # precomputed candidate.json (per-env id lists) intersected with the
+        # per-window slice; submit OpenMath, fall back to OpenCode on
+        # batch_filled, wait for the next window if both fill. No frontier probe.
+        self.selection_mode = selection_mode
+        self._smart_order = ["openmathinstruct", "opencodeinstruct"]
+        self._smart_candidates: dict[str, set[int]] = {}
+        self._smart_prev_cooldown: dict[str, set[int]] = {}
+        self._smart_window_n: int | None = None
+        self._smart_current_env = self._smart_order[0]
+        self._smart_filled: set[str] = set()
+        if selection_mode == "smart":
+            self._load_smart_candidates(candidate_path)
 
         # Lazy imports for heavy deps — keep module import cheap.
         from reliquary.shared.hf_compat import resolve_hidden_size
@@ -382,55 +399,80 @@ class MiningEngine:
                     await asyncio.sleep(0.1)
                     continue
 
-                # OpenMath-only scored selection: fetch this env's own
-                # cooldown set (``prompt_idx`` is per-env), falling back to the
-                # flat base set on a fetch error rather than stall the loop.
-                env = self._score_env
-                env_name = getattr(env, "name", "openmathinstruct")
-                try:
-                    env_state = await get_window_state_v2(
-                        url, env=env_name, client=client,
-                    )
-                    cooldown_prompts = set(env_state.cooldown_prompts)
-                except Exception:
-                    cooldown_prompts = set(state.cooldown_prompts)
-                self._cooldown_per_env[env_name] = cooldown_prompts
-
                 recorder = get_recorder()
-                # Layers 1-3 (slice → score → cooldown) + Layer 4 (frontier
-                # probe): pick a scored candidate whose cheap 4-rollout probe
-                # has a MIXED reward signal, so it won't fail OUT_OF_ZONE.
-                _t_gen = time.perf_counter()
-                probe_result = await self._probe_for_valid_prompt(
-                    env, randomness, cooldown_prompts, state.window_n,
-                )
-                if probe_result is None:
-                    logger.info(
-                        "no frontier prompt in window %d "
-                        "(candidates uniform/exhausted); waiting",
-                        state.window_n,
+                if self.selection_mode == "smart":
+                    # SMART pipeline: candidate.json ∩ per-window slice, submit
+                    # OpenMath then fall back to OpenCode on batch_filled. No
+                    # frontier probe — submit directly.
+                    pick = await self._smart_pick(randomness, state, url, client)
+                    if pick is None:
+                        logger.info(
+                            "smart: no eligible env/candidate for window %d; "
+                            "waiting", state.window_n,
+                        )
+                        await asyncio.sleep(5)
+                        continue
+                    env, env_name, prompt_idx, problem = pick
+                    _t_gen = time.perf_counter()
+                    generations = self._generate_m_rollouts(problem, randomness)
+                    recorder.record_generation(
+                        state.window_n, time.perf_counter() - _t_gen, M_ROLLOUTS,
                     )
-                    await asyncio.sleep(5)
-                    continue
-                prompt_idx, problem, probe_rollouts = probe_result
+                    if len(generations) < M_ROLLOUTS:
+                        logger.warning(
+                            "generated %d/%d for prompt %d; skipping",
+                            len(generations), M_ROLLOUTS, prompt_idx,
+                        )
+                        continue
+                else:
+                    # SCORE pipeline (OpenMath-only): fetch this env's own
+                    # cooldown set (``prompt_idx`` is per-env), falling back to
+                    # the flat base set on a fetch error rather than stall.
+                    env = self._score_env
+                    env_name = getattr(env, "name", "openmathinstruct")
+                    try:
+                        env_state = await get_window_state_v2(
+                            url, env=env_name, client=client,
+                        )
+                        cooldown_prompts = set(env_state.cooldown_prompts)
+                    except Exception:
+                        cooldown_prompts = set(state.cooldown_prompts)
+                    self._cooldown_per_env[env_name] = cooldown_prompts
 
-                # Top up the probe sample to a full M_ROLLOUTS group, reusing
-                # the probe rollouts (all are identical T_PROTO samples).
-                need = M_ROLLOUTS - len(probe_rollouts)
-                extra = (
-                    self._generate_m_rollouts(problem, randomness, n=need)
-                    if need > 0 else []
-                )
-                generations = (probe_rollouts + extra)[:M_ROLLOUTS]
-                recorder.record_generation(
-                    state.window_n, time.perf_counter() - _t_gen, M_ROLLOUTS,
-                )
-                if len(generations) < M_ROLLOUTS:
-                    logger.warning(
-                        "generated %d/%d for prompt %d; skipping",
-                        len(generations), M_ROLLOUTS, prompt_idx,
+                    # Layers 1-3 (slice → score → cooldown) + Layer 4 (frontier
+                    # probe): pick a scored candidate whose cheap 4-rollout probe
+                    # has a MIXED reward signal, so it won't fail OUT_OF_ZONE.
+                    _t_gen = time.perf_counter()
+                    probe_result = await self._probe_for_valid_prompt(
+                        env, randomness, cooldown_prompts, state.window_n,
                     )
-                    continue
+                    if probe_result is None:
+                        logger.info(
+                            "no frontier prompt in window %d "
+                            "(candidates uniform/exhausted); waiting",
+                            state.window_n,
+                        )
+                        await asyncio.sleep(5)
+                        continue
+                    prompt_idx, problem, probe_rollouts = probe_result
+
+                    # Top up the probe sample to a full M_ROLLOUTS group, reusing
+                    # the probe rollouts (all are identical T_PROTO samples).
+                    need = M_ROLLOUTS - len(probe_rollouts)
+                    extra = (
+                        self._generate_m_rollouts(problem, randomness, n=need)
+                        if need > 0 else []
+                    )
+                    generations = (probe_rollouts + extra)[:M_ROLLOUTS]
+                    recorder.record_generation(
+                        state.window_n, time.perf_counter() - _t_gen, M_ROLLOUTS,
+                    )
+                    if len(generations) < M_ROLLOUTS:
+                        logger.warning(
+                            "generated %d/%d for prompt %d; skipping",
+                            len(generations), M_ROLLOUTS, prompt_idx,
+                        )
+                        continue
 
                 # Window-change guard #1: generation took tens of seconds. If
                 # the window advanced, the captured window_n/randomness are now
@@ -540,6 +582,9 @@ class MiningEngine:
                     # content in this process (→ HASH_DUPLICATE).
                     for _h in gen_hashes:
                         self._remember_rollout_hash(_h)
+                    # SMART: on batch_filled, switch OpenMath→OpenCode (or wait).
+                    if self.selection_mode == "smart":
+                        self._smart_after_submit(env_name, resp)
                 except SubmissionError as exc:
                     logger.error("submit failed: %s", exc)
 
@@ -548,6 +593,130 @@ class MiningEngine:
                 recorder.write_result_md()
 
         return results
+
+    def _load_smart_candidates(self, candidate_path: str | None) -> None:
+        """Load per-env candidate id lists from candidate.json for smart mode."""
+        import json
+        import os
+
+        tried = [
+            candidate_path,
+            os.environ.get("RELIQUARY_CANDIDATE_JSON"),
+            "candidate.json",
+            os.path.join("reliquary", "candidate.json"),
+        ]
+        for p in tried:
+            if p and os.path.exists(p):
+                try:
+                    data = json.load(open(p))
+                except Exception:
+                    logger.exception("smart: failed to read candidate file %s", p)
+                    continue
+                for env_name in self._smart_order:
+                    grp = data.get(env_name) or {}
+                    ids = grp.get("candidate_ids", []) or []
+                    self._smart_candidates[env_name] = {int(i) for i in ids}
+                logger.info(
+                    "smart: loaded candidates from %s: %s", p,
+                    {e: len(self._smart_candidates.get(e, set())) for e in self._smart_order},
+                )
+                return
+        logger.error(
+            "smart: candidate.json not found (tried %s); no candidates loaded",
+            [t for t in tried if t],
+        )
+        for env_name in self._smart_order:
+            self._smart_candidates.setdefault(env_name, set())
+
+    async def _smart_pick(self, randomness: str, state, url, client):
+        """Smart selection: candidate.json ∩ per-window slice, with OpenMath→
+        OpenCode batch_filled fallback.
+
+        Returns ``(env, env_name, prompt_idx, problem)`` or ``None`` when every
+        active env is filled / has no eligible candidate this window. Consumes
+        the chosen id so it isn't re-picked, and prunes ids that newly entered
+        cooldown since the previous window (the "remove last window's cooldown"
+        step).
+        """
+        from reliquary.miner.submitter import get_window_state_v2
+
+        if self._smart_window_n != state.window_n:
+            self._smart_window_n = state.window_n
+            self._smart_current_env = self._smart_order[0]
+            self._smart_filled = set()
+
+        order = [e for e in self._smart_order if e in self.envs]
+        active = [e for e in order if e not in self._smart_filled]
+        if not active:
+            return None
+        if self._smart_current_env not in active:
+            self._smart_current_env = active[0]
+        env_name = self._smart_current_env
+        env = self.envs[env_name]
+
+        # Cooldown for this env; prune candidates that newly entered cooldown.
+        try:
+            es = await get_window_state_v2(url, env=env_name, client=client)
+            cooldown = set(es.cooldown_prompts)
+        except Exception:
+            cooldown = set(state.cooldown_prompts)
+        # Prune candidates that newly entered cooldown SINCE the previous
+        # window. The first time we see an env we only record the baseline —
+        # pruning against the full cooldown there would wipe candidate.json
+        # (its ids are, by construction, the older cooldown population).
+        prev = self._smart_prev_cooldown.get(env_name)
+        if prev is not None:
+            newly_cooled = cooldown - prev
+            if newly_cooled:
+                before = len(self._smart_candidates[env_name])
+                self._smart_candidates[env_name] -= newly_cooled
+                pruned = before - len(self._smart_candidates[env_name])
+                if pruned:
+                    logger.info(
+                        "smart: pruned %d newly-cooled candidate(s) from %s",
+                        pruned, env_name,
+                    )
+        self._smart_prev_cooldown[env_name] = cooldown
+
+        # Eligible = candidate ids inside this window's slice.
+        from reliquary.miner.prompt_scoring import eligible_in_slice
+        lo, hi = window_prompt_range(
+            randomness, env_name, len(env), PROMPT_RANGE_SIZE,
+        )
+        eligible = eligible_in_slice(self._smart_candidates[env_name], (lo, hi))
+        if not eligible:
+            logger.info(
+                "smart: env=%s no eligible candidate in slice [%d,%d); skipping env",
+                env_name, lo, hi,
+            )
+            self._smart_filled.add(env_name)
+            return await self._smart_pick(randomness, state, url, client)
+
+        idx = self._rng.choice(eligible)
+        self._smart_candidates[env_name].discard(idx)  # consume
+        problem = env.get_problem(idx)
+        logger.info(
+            "smart pick env=%s prompt=%d (eligible=%d in [%d,%d))",
+            env_name, idx, len(eligible), lo, hi,
+        )
+        return env, env_name, idx, problem
+
+    def _smart_after_submit(self, env_name: str, resp) -> None:
+        """On batch_filled, mark the env filled and switch to the next one."""
+        reason = resp.reason.value if hasattr(resp.reason, "value") else resp.reason
+        if reason == "batch_filled":
+            self._smart_filled.add(env_name)
+            active = [
+                e for e in self._smart_order
+                if e in self.envs and e not in self._smart_filled
+            ]
+            self._smart_current_env = active[0] if active else env_name
+            logger.info(
+                "smart: %s batch_filled; %s",
+                env_name,
+                f"switching to {self._smart_current_env}" if active
+                else "both envs filled, waiting for next window",
+            )
 
     async def _probe_for_valid_prompt(
         self, env, randomness: str, cooldown_prompts: set[int], window_n: int,

@@ -2,10 +2,22 @@
 
 from reliquary.miner.prompt_scoring import (
     build_calibration,
+    eligible_in_slice,
     is_frontier_signal,
     rank_candidates,
     read_records,
 )
+
+
+def test_eligible_in_slice_intersects_window():
+    candidates = {5, 50, 150, 999, 4999, 5000, 6000}
+    # slice [100, 5000) → keep 150, 999, 4999 (5000 is exclusive)
+    got = sorted(eligible_in_slice(candidates, (100, 5000)))
+    assert got == [150, 999, 4999]
+
+
+def test_eligible_in_slice_empty_when_disjoint():
+    assert eligible_in_slice({1, 2, 3}, (100, 200)) == []
 
 
 def test_frontier_signal_uniform_rejected():

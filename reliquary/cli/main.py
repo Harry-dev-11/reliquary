@@ -180,6 +180,17 @@ def mine(
         ),
     ),
     log_level: str = typer.Option("INFO", help="Log level"),
+    pipeline: str = typer.Option(
+        os.getenv("RELIQUARY_PIPELINE", "score"),
+        help="Prompt-selection pipeline: 'score' (frontier probe, OpenMath only) "
+             "or 'smart' (candidate.json ∩ window slice, OpenMath→OpenCode "
+             "batch_filled fallback). env: RELIQUARY_PIPELINE",
+    ),
+    candidate_path: str = typer.Option(
+        os.getenv("RELIQUARY_CANDIDATE_JSON", ""),
+        help="Path to candidate.json for the 'smart' pipeline (default: "
+             "candidate.json in CWD). env: RELIQUARY_CANDIDATE_JSON",
+    ),
 ):
     """Run Reliquary miner."""
     setup_logging(log_level)
@@ -307,6 +318,8 @@ def mine(
             mix=mix,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
+            selection_mode=pipeline,
+            candidate_path=candidate_path or None,
         )
 
         # Seed engine's _loaded_checkpoint_path so the first
