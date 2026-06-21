@@ -241,6 +241,39 @@ def score_record(rec: dict, cal: dict) -> float:
             + ans_s * TOTAL_W["expected_answer"])
 
 
+# ── smart pipeline: candidate.json parsing ──────────────────────────────────
+def parse_candidate_json(data: dict, env_order: list) -> dict:
+    """Parse candidate.json into ``{env_name: set[int]}`` for smart mode.
+
+    Supports two layouts:
+
+    * **Per-env groups** — ``{"openmathinstruct": {"candidate_ids": [...]},
+      "opencodeinstruct": {...}}``.
+    * **Flat scored list** — ``{"ids": [...]}`` or ``{"candidates":
+      [{"id": .., "score": ..}, ...]}`` with no env label; treated as
+      ``openmathinstruct`` (the scorer's domain), OpenCode left empty.
+    """
+    out = {e: set() for e in env_order}
+
+    grouped = any(
+        isinstance(data.get(e), dict) and "candidate_ids" in data.get(e, {})
+        for e in env_order
+    )
+    if grouped:
+        for env_name in env_order:
+            grp = data.get(env_name) or {}
+            out[env_name] = {int(i) for i in (grp.get("candidate_ids") or [])}
+        return out
+
+    # Flat layout → OpenMath only.
+    ids = data.get("ids")
+    if ids is None and isinstance(data.get("candidates"), list):
+        ids = [c["id"] for c in data["candidates"]
+               if isinstance(c, dict) and "id" in c]
+    out["openmathinstruct"] = {int(i) for i in (ids or [])}
+    return out
+
+
 # ── smart pipeline: candidate ∩ window slice ────────────────────────────────
 def eligible_in_slice(candidate_ids, prompt_range) -> list[int]:
     """Candidate ids that fall inside the per-window ``[lo, hi)`` slice.

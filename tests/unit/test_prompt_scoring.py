@@ -4,9 +4,41 @@ from reliquary.miner.prompt_scoring import (
     build_calibration,
     eligible_in_slice,
     is_frontier_signal,
+    parse_candidate_json,
     rank_candidates,
     read_records,
 )
+
+_ENV_ORDER = ["openmathinstruct", "opencodeinstruct"]
+
+
+def test_parse_candidate_flat_ids():
+    data = {"count": 3, "ids": [3426, 526010, 1733332]}
+    out = parse_candidate_json(data, _ENV_ORDER)
+    assert out["openmathinstruct"] == {3426, 526010, 1733332}
+    assert out["opencodeinstruct"] == set()
+
+
+def test_parse_candidate_flat_candidates_objects():
+    data = {"candidates": [{"id": 10, "score": 9.1}, {"id": 20, "score": 8.0}]}
+    out = parse_candidate_json(data, _ENV_ORDER)
+    assert out["openmathinstruct"] == {10, 20}
+
+
+def test_parse_candidate_per_env_groups():
+    data = {
+        "openmathinstruct": {"candidate_ids": [1, 2, 3]},
+        "opencodeinstruct": {"candidate_ids": [7, 8]},
+    }
+    out = parse_candidate_json(data, _ENV_ORDER)
+    assert out["openmathinstruct"] == {1, 2, 3}
+    assert out["opencodeinstruct"] == {7, 8}
+
+
+def test_parse_candidate_empty():
+    assert parse_candidate_json({}, _ENV_ORDER) == {
+        "openmathinstruct": set(), "opencodeinstruct": set()
+    }
 
 
 def test_eligible_in_slice_intersects_window():

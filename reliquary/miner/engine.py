@@ -605,6 +605,7 @@ class MiningEngine:
             "candidate.json",
             os.path.join("reliquary", "candidate.json"),
         ]
+        from reliquary.miner.prompt_scoring import parse_candidate_json
         for p in tried:
             if p and os.path.exists(p):
                 try:
@@ -612,10 +613,7 @@ class MiningEngine:
                 except Exception:
                     logger.exception("smart: failed to read candidate file %s", p)
                     continue
-                for env_name in self._smart_order:
-                    grp = data.get(env_name) or {}
-                    ids = grp.get("candidate_ids", []) or []
-                    self._smart_candidates[env_name] = {int(i) for i in ids}
+                self._smart_candidates = parse_candidate_json(data, self._smart_order)
                 logger.info(
                     "smart: loaded candidates from %s: %s", p,
                     {e: len(self._smart_candidates.get(e, set())) for e in self._smart_order},
