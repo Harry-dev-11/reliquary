@@ -8,8 +8,10 @@ Merkle root commitment, HTTP batch submission to validator.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 import random as _random
@@ -27,6 +29,7 @@ from reliquary.constants import (
     WINDOW_LENGTH,
 )
 from reliquary.shared.prompt_range import window_prompt_range
+from reliquary.miner.timing import get_recorder
 from reliquary.infrastructure import chain
 from reliquary.protocol.signatures import sign_envelope
 from reliquary.protocol.submission import (
@@ -73,12 +76,17 @@ async def _hf_download(repo_id: str, revision: str) -> str:
     from huggingface_hub import snapshot_download
     from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
 
-    return await asyncio.to_thread(
+    t0 = time.perf_counter()
+    path = await asyncio.to_thread(
         snapshot_download,
         repo_id=repo_id,
         revision=revision,
         allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
     )
+    get_recorder().record_one_time(
+        f"model download ({repo_id}@{revision[:12]})", time.perf_counter() - t0,
+    )
+    return path
 
 
 def pick_prompt_idx(
@@ -194,6 +202,22 @@ def _compute_merkle_root(rollouts) -> str:
     return leaves[0].hex()
 
 
+def _rollout_token_hash(tokens) -> bytes:
+    """SHA256 over *tokens* as 4-byte big-endian unsigned ints.
+
+    MUST stay byte-identical to
+    ``reliquary.validator.dedup.compute_rollout_hash`` so the miner's local
+    distinct-rollout guard predicts the validator's HASH_DUPLICATE check
+    exactly. The validator hashes ``rollout.commit["tokens"]`` — the full
+    prompt+completion sequence — which equals the generation dict's
+    ``"tokens"`` here.
+    """
+    h = hashlib.sha256()
+    for t in tokens:
+        h.update(int(t).to_bytes(4, "big", signed=False))
+    return h.digest()
+
+
 def _current_drand_round_at_send() -> int:
     """Drand quicknet round currently in progress at wall-clock now.
 
@@ -254,6 +278,12 @@ class MiningEngine:
         self._scored_window_key: tuple | None = None
         self._scored_queue: list[int] = []
         self._rng = _random.Random()
+
+        # Per-process memory of rollout-token hashes we've already submitted,
+        # so a restart-in-process / re-pick never re-sends content the
+        # validator would reject with HASH_DUPLICATE. Bounded LRU.
+        self._recent_rollout_hashes: "OrderedDict[bytes, None]" = OrderedDict()
+        self._recent_rollout_cap = 4096
 
         # Lazy imports for heavy deps — keep module import cheap.
         from reliquary.shared.hf_compat import resolve_hidden_size
@@ -369,7 +399,12 @@ class MiningEngine:
                     continue
 
                 problem = env.get_problem(prompt_idx)
+                recorder = get_recorder()
+                _t_gen = time.perf_counter()
                 generations = self._generate_m_rollouts(problem, randomness)
+                recorder.record_generation(
+                    state.window_n, time.perf_counter() - _t_gen, M_ROLLOUTS,
+                )
                 if len(generations) < M_ROLLOUTS:
                     logger.warning(
                         "generated %d/%d for prompt %d; skipping",
@@ -377,11 +412,63 @@ class MiningEngine:
                     )
                     continue
 
-                rollout_submissions = [
-                    self._build_rollout_submission(gen, problem, randomness, env=env)
-                    for gen in generations
-                ]
+                # Window-change guard #1: generation took tens of seconds. If
+                # the window advanced, the captured window_n/randomness are now
+                # stale — discard before spending GRAIL rather than POST a
+                # submission the validator will reject.
+                if await self._window_changed(url, client, state):
+                    logger.info(
+                        "window advanced during generation (was %d); "
+                        "discarding %d rollouts for prompt %d",
+                        state.window_n, len(generations), prompt_idx,
+                    )
+                    continue
+
+                # Distinct-rollout guard: the validator rejects the WHOLE group
+                # with HASH_DUPLICATE if any two rollouts share token content,
+                # or if any rollout matches one already accepted in its
+                # retention window. Predict both here and skip before spending
+                # GRAIL. A group with duplicate completions is also low-σ
+                # (likely OUT_OF_ZONE), so skipping it is doubly correct.
+                gen_hashes = [_rollout_token_hash(g["tokens"]) for g in generations]
+                if len(set(gen_hashes)) < len(gen_hashes):
+                    logger.info(
+                        "prompt %d: rollouts not all distinct "
+                        "(%d unique of %d); skipping (would be hash_duplicate)",
+                        prompt_idx, len(set(gen_hashes)), len(gen_hashes),
+                    )
+                    continue
+                if any(h in self._recent_rollout_hashes for h in gen_hashes):
+                    logger.info(
+                        "prompt %d: produced already-submitted rollouts; "
+                        "skipping (would be hash_duplicate)", prompt_idx,
+                    )
+                    continue
+
+                # Build each rollout's GRAIL proof one by one, timing each.
+                rollout_submissions = []
+                for _i, gen in enumerate(generations, start=1):
+                    _t_grail = time.perf_counter()
+                    sub = self._build_rollout_submission(
+                        gen, problem, randomness, env=env,
+                    )
+                    recorder.record_grail(
+                        state.window_n, _i, len(generations),
+                        time.perf_counter() - _t_grail,
+                    )
+                    rollout_submissions.append(sub)
                 merkle_root = _compute_merkle_root(rollout_submissions)
+
+                # Window-change guard #2: last-line defense for a window change
+                # during the GRAIL pass. Cheaper to re-poll than to POST a
+                # stale submission and burn the validator's WINDOW_MISMATCH path.
+                if await self._window_changed(url, client, state):
+                    logger.info(
+                        "window advanced during GRAIL build (was %d); "
+                        "dropping submission for prompt %d",
+                        state.window_n, prompt_idx,
+                    )
+                    continue
 
                 # v2.3 design A': fetch the drand round just before the POST.
                 # The attached round determines the submission's chronological
@@ -428,10 +515,51 @@ class MiningEngine:
                         resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                     )
                     results.append(resp)
+                    recorder.mark_window_submitted()
+                    # Remember what we sent so we never re-POST identical
+                    # content in this process (→ HASH_DUPLICATE).
+                    for _h in gen_hashes:
+                        self._remember_rollout_hash(_h)
                 except SubmissionError as exc:
                     logger.error("submit failed: %s", exc)
 
+                # Refresh the timing report after every attempt so the
+                # operator always has a current result.md while mining.
+                recorder.write_result_md()
+
         return results
+
+    def _remember_rollout_hash(self, h: bytes) -> None:
+        """Record a submitted rollout hash in the bounded LRU."""
+        self._recent_rollout_hashes[h] = None
+        self._recent_rollout_hashes.move_to_end(h)
+        while len(self._recent_rollout_hashes) > self._recent_rollout_cap:
+            self._recent_rollout_hashes.popitem(last=False)
+
+    async def _window_changed(self, url, client, prior_state) -> bool:
+        """True if the active window sealed/advanced since ``prior_state``.
+
+        Generation + GRAIL take tens of seconds, during which the validator
+        may seal the window and open the next one — binding the in-flight
+        submission to a stale ``window_n`` / ``randomness`` that the validator
+        will reject (``WINDOW_MISMATCH`` / ``WRONG_RANDOMNESS``). Re-poll
+        ``/state`` so the caller can discard the work early instead of
+        spending GRAIL on a doomed submission. Best-effort: a failed re-poll
+        returns False (can't confirm a change → proceed and let the POST
+        decide) rather than throwing away possibly-good work.
+        """
+        from reliquary.miner.submitter import get_window_state_v2
+        from reliquary.protocol.submission import WindowState
+
+        try:
+            now = await get_window_state_v2(url, client=client)
+        except Exception:
+            return False
+        return (
+            now.state != WindowState.OPEN
+            or now.window_n != prior_state.window_n
+            or now.randomness != prior_state.randomness
+        )
 
     def _next_scored_prompt(
         self, randomness: str, cooldown_prompts: set[int], window_n: int,

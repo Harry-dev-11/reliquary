@@ -231,7 +231,9 @@ def mine(
                 url = discover_validator_url(metagraph)
 
             import httpx
+            import time as _time
             from huggingface_hub import snapshot_download
+            from reliquary.miner.timing import get_recorder
             async with httpx.AsyncClient(timeout=30) as client:
                 state = await get_window_state_v2(url, client=client)
             if state.checkpoint_repo_id and state.checkpoint_revision:
@@ -241,10 +243,14 @@ def mine(
                     url, state.checkpoint_n, state.checkpoint_repo_id,
                     state.checkpoint_revision[:12],
                 )
+                _t_dl = _time.perf_counter()
                 initial_path = snapshot_download(
                     repo_id=state.checkpoint_repo_id,
                     revision=state.checkpoint_revision,
                     allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
+                )
+                get_recorder().record_one_time(
+                    "model download (boot seed)", _time.perf_counter() - _t_dl,
                 )
                 logger.info("Using initial checkpoint path: %s", initial_path)
             else:
@@ -260,8 +266,12 @@ def mine(
             )
 
         # --- Load models from resolved path ---
+        import time as _time
+        from reliquary.miner.timing import get_recorder
+        _recorder = get_recorder()
         logger.info("Loading models from %s...", initial_path)
         tokenizer = load_tokenizer(initial_path)
+        _t_modelload = _time.perf_counter()
 
         # Use 2 GPUs when available (vllm on 0, HF proof on 1). Fall back to
         # sharing GPU 0 for test boxes that only expose one device.
@@ -278,8 +288,15 @@ def mine(
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
         ).to(proof_device).eval()
+        _recorder.record_one_time(
+            "model load (both copies to GPU)", _time.perf_counter() - _t_modelload,
+        )
 
+        _t_ds = _time.perf_counter()
         envs = load_environments(env_names)
+        _recorder.record_one_time(
+            "dataset load", _time.perf_counter() - _t_ds,
+        )
         mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in envs]
         engine = MiningEngine(
             vllm_model,
