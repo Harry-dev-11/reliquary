@@ -213,9 +213,16 @@ def mine(
         network, netuid, env_names,
     )
 
-    # Miners never grade (opencode reward is validator-authoritative), so this
-    # stays False; the gVisor grader runs on the validator only.
-    if _miner_requires_grader(env_names):
+    # Miners normally never grade (opencode reward is validator-authoritative),
+    # so the gVisor grader runs on the validator only. EXCEPTION: group/key-id
+    # selection's out-of-zone gate needs a REAL local reward to count reward-1
+    # rollouts, so when selecting from an authoritative env (opencode) the miner
+    # must run a local grader — otherwise every group reads 0 and gets pruned.
+    _zone_gate_needs_grader = bool(key_ids) and selection_env == "opencodeinstruct"
+    if _miner_requires_grader(env_names) or _zone_gate_needs_grader:
+        if _zone_gate_needs_grader:
+            logger.info("Group-selection zone gate on %s needs a local grader; launching.",
+                        selection_env)
         _ensure_grader_running()
     elif "opencodeinstruct" in env_names:
         logger.info("OpenCode miner: reward is validator-authoritative; skipping local grader launch.")
@@ -320,8 +327,28 @@ def mine(
                 key_ids, gpaths, selection_env,
                 zone_low=zone_low, zone_high=zone_high,
             )
-            logger.info("Group/key-id selection enabled: key_ids=%s groups=%s env=%s zone=%d..%d",
-                        key_ids, gpaths, selection_env, zone_low, zone_high)
+
+            # Shard/universe guard: the window slice [lo,hi) and get_problem(idx)
+            # both live in [0, len(env)). If group ids exceed it, get_problem wraps
+            # (idx % len) to the WRONG problem and those ids never land in-slice —
+            # the miner would burn rollouts on PROMPT_MISMATCH/OUT_OF_ZONE rejects.
+            # Fail fast: the loaded dataset must cover the group id space AND match
+            # the validator's len(env) (same shards).
+            universe_n = len(envs[selection_env])
+            if group_selector.id2group:
+                max_gid = max(group_selector.id2group)
+                if max_gid >= universe_n:
+                    n_over = sum(1 for i in group_selector.id2group if i >= universe_n)
+                    raise typer.BadParameter(
+                        f"group ids exceed len({selection_env})={universe_n}: "
+                        f"{n_over} ids up to {max_gid} would wrap to the wrong problem "
+                        f"and never land in-slice. Load enough OpenMath shards "
+                        f"(RELIQUARY_OMI_SHARDS) — at least covering id {max_gid} — and "
+                        f"match the validator's len(env)."
+                    )
+            logger.info("Group/key-id selection enabled: key_ids=%s groups=%s env=%s "
+                        "len(env)=%d zone=%d..%d",
+                        key_ids, gpaths, selection_env, universe_n, zone_low, zone_high)
 
         engine = MiningEngine(
             vllm_model,
