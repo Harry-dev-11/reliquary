@@ -225,6 +225,7 @@ class MiningEngine:
         proof_gpu: int = 1,
         max_new_tokens: int = MAX_NEW_TOKENS_PROTOCOL_CAP,
         validator_url_override: str | None = None,
+        group_selector=None,
     ) -> None:
         self.vllm_model = vllm_model
         self.hf_model = hf_model
@@ -234,6 +235,9 @@ class MiningEngine:
         self.proof_gpu = proof_gpu
         self.max_new_tokens = max_new_tokens
         self.validator_url_override = validator_url_override
+        # Opt-in group/key-id selection (GroupSelector). When None the miner uses
+        # the stock uniform-random pick_env_and_prompt.
+        self.group_selector = group_selector
 
         if envs is not None and mix is not None:
             self.envs = envs
@@ -350,17 +354,39 @@ class MiningEngine:
                         self._cooldown_per_env[env_name] = set(
                             state.cooldown_prompts
                         )
-                try:
-                    env_name, prompt_idx = pick_env_and_prompt(
-                        self.envs, self.mix, self._cooldown_per_env, rng=rng,
-                        randomness=randomness,
-                    )
-                except RuntimeError:
-                    logger.info("all envs fully in cooldown; sleeping")
-                    await asyncio.sleep(5)
-                    continue
+                # --- prompt selection ---
+                # group-selection (opt-in) walks key_id.json -> group -> in-slice
+                # non-cooldown candidate; stock path is uniform-random.
+                selected_key_id = None
+                if self.group_selector is not None:
+                    gs = self.group_selector
+                    env_name = gs.env_name
+                    env = self.envs[env_name]
+                    live_cd = self._cooldown_per_env.get(env_name, set())
+                    sel = gs.next_selection(randomness, len(env), live_cd)
+                    if sel is None:
+                        if gs.exhausted():
+                            logger.info("group-selection: key id list exhausted; stopping")
+                            break
+                        logger.info(
+                            "group-selection: no key id lands in window %d; waiting",
+                            state.window_n,
+                        )
+                        await asyncio.sleep(5)
+                        continue
+                    selected_key_id, prompt_idx, _gid = sel
+                else:
+                    try:
+                        env_name, prompt_idx = pick_env_and_prompt(
+                            self.envs, self.mix, self._cooldown_per_env, rng=rng,
+                            randomness=randomness,
+                        )
+                    except RuntimeError:
+                        logger.info("all envs fully in cooldown; sleeping")
+                        await asyncio.sleep(5)
+                        continue
+                    env = self.envs[env_name]
 
-                env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
                 generations = self._generate_m_rollouts(problem, randomness)
                 if len(generations) < M_ROLLOUTS:
@@ -369,6 +395,28 @@ class MiningEngine:
                         len(generations), M_ROLLOUTS, prompt_idx,
                     )
                     continue
+
+                # --- out-of-zone gate (group-selection only) ---
+                # Skip submitting groups whose reward-1 count is outside the
+                # trainable band; prune the key id so its group isn't re-picked.
+                if selected_key_id is not None:
+                    gs = self.group_selector
+                    n_success = 0
+                    for gen in generations:
+                        completion = self.tokenizer.decode(
+                            gen["tokens"][gen["prompt_length"]:]
+                        )
+                        if env.compute_reward(problem, completion) >= gs.success_threshold:
+                            n_success += 1
+                    if not gs.in_zone(n_success):
+                        gs.prune(selected_key_id)
+                        logger.info(
+                            "OUT_OF_ZONE: key %d -> prompt %d %d/%d reward-1 "
+                            "(need %d..%d); pruned, not submitting",
+                            selected_key_id, prompt_idx, n_success, M_ROLLOUTS,
+                            gs.zone_low, gs.zone_high,
+                        )
+                        continue
 
                 rollout_submissions = [
                     self._build_rollout_submission(gen, problem, randomness, env=env)
@@ -421,6 +469,12 @@ class MiningEngine:
                         resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                     )
                     results.append(resp)
+                    # group-selection: a key id whose group submitted successfully
+                    # is done — prune it from key_id.json.
+                    if selected_key_id is not None and resp.accepted:
+                        self.group_selector.prune(selected_key_id)
+                        logger.info("group-selection: pruned accepted key %d",
+                                    selected_key_id)
                 except SubmissionError as exc:
                     logger.error("submit failed: %s", exc)
 

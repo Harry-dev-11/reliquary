@@ -179,6 +179,25 @@ def mine(
             "Useful for local testing — e.g. http://127.0.0.1:8888"
         ),
     ),
+    key_ids: str = typer.Option(
+        os.getenv("RELIQUARY_KEY_IDS", ""),
+        help=(
+            "Enable group/key-id prompt selection: path to key_id.json. When set, "
+            "the miner walks these key ids (group -> in-slice non-cooldown candidate) "
+            "with an out-of-zone gate, instead of random selection (env: RELIQUARY_KEY_IDS)."
+        ),
+    ),
+    group_files: str = typer.Option(
+        os.getenv("RELIQUARY_GROUP_FILES", ""),
+        help="Comma-separated group file(s) for --key-ids (default: group.part1.json,"
+             "group.part2.json or group.json)",
+    ),
+    selection_env: str = typer.Option(
+        "openmathinstruct",
+        help="Env the group selection draws from (must match the groups' index space)",
+    ),
+    zone_low: int = typer.Option(2, help="In-zone if #reward-1 rollouts >= this"),
+    zone_high: int = typer.Option(6, help="In-zone if #reward-1 rollouts <= this"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
     """Run Reliquary miner."""
@@ -281,6 +300,29 @@ def mine(
 
         envs = load_environments(env_names)
         mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in envs]
+
+        # Opt-in group/key-id prompt selection (replaces random pick when --key-ids set).
+        group_selector = None
+        if key_ids:
+            from reliquary.miner.group_selection import GroupSelector, resolve_group_paths
+            if selection_env not in envs:
+                raise typer.BadParameter(
+                    f"--selection-env={selection_env} not in --environments ({env_names})"
+                )
+            gpaths = resolve_group_paths(
+                [p.strip() for p in group_files.split(",") if p.strip()] or None
+            )
+            if not gpaths:
+                raise typer.BadParameter(
+                    "no group file found (looked for --group-files, group.part1/2.json, group.json)"
+                )
+            group_selector = GroupSelector(
+                key_ids, gpaths, selection_env,
+                zone_low=zone_low, zone_high=zone_high,
+            )
+            logger.info("Group/key-id selection enabled: key_ids=%s groups=%s env=%s zone=%d..%d",
+                        key_ids, gpaths, selection_env, zone_low, zone_high)
+
         engine = MiningEngine(
             vllm_model,
             hf_model,
@@ -290,6 +332,7 @@ def mine(
             mix=mix,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
+            group_selector=group_selector,
         )
 
         # Seed engine's _loaded_checkpoint_path so the first
