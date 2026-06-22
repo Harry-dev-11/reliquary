@@ -251,8 +251,10 @@ async def _run_submit(args, env_fqn: str) -> None:
         ATTN_IMPLEMENTATION, M_ROLLOUTS, PROMPT_RANGE_SIZE,
     )
     from reliquary.environment import load_environment
+    import asyncio
     from reliquary.miner.engine import (
-        MiningEngine, _compute_merkle_root, _current_drand_round_at_send,
+        MiningEngine, maybe_pull_checkpoint, _hf_download,
+        _compute_merkle_root, _current_drand_round_at_send,
     )
     from reliquary.miner.submitter import (
         SubmissionError, get_window_state_v2, submit_batch_v2,
@@ -300,12 +302,8 @@ async def _run_submit(args, env_fqn: str) -> None:
     if not (state.checkpoint_repo_id and state.checkpoint_revision):
         raise SystemExit("validator has no published checkpoint; cannot build a "
                          "matching GRAIL proof — submit aborted")
-    randomness = state.randomness or args.randomness
-    if not randomness:
-        raise SystemExit("window randomness empty (window not OPEN yet); retry shortly")
     local_hash = state.checkpoint_revision
-    window_n = state.window_n
-    live_cooldown = {int(x) for x in state.cooldown_prompts}
+    local_n = state.checkpoint_n
 
     # grader for opencode rewards (zone check)
     if args.env == "opencode":
@@ -346,122 +344,180 @@ async def _run_submit(args, env_fqn: str) -> None:
         logger.warning("DATASET TOO SMALL: max group id %d >= len(env)=%d — ids "
                        "wrap/never land in-slice.", max(id2group), universe_n)
 
-    lo, hi = window_prompt_range(randomness, env_fqn, universe_n, PROMPT_RANGE_SIZE)
-    logger.info("window %d slice [%d,%d) cooldown_ids=%d (randomness=%s...)",
-                window_n, lo, hi, len(live_cooldown), randomness[:12])
-
     zone_high = min(args.zone_high, M_ROLLOUTS)
     records: list[dict] = []
+    dead_keys: set[int] = set()  # no_group keys never match — skip after first miss
+
+    async def _process_key(key_id, lo, hi, live_cooldown, window_n, local_hash,
+                           randomness, client):
+        """Select -> generate -> zone -> (in-zone) submit. Returns the record."""
+        rec, selected = _select_candidate(
+            env_fqn, key_id, id2group, group_ids, live_cooldown, lo, hi, args.candidate,
+        )
+        rec["window_n"] = window_n
+        if selected is None:
+            logger.info("key %d: %s — next", key_id, rec["status"])
+            return rec
+
+        problem = env.get_problem(selected)
+        gt0 = time.perf_counter()
+        generations = engine._generate_m_rollouts(problem, randomness)
+        generate_s = time.perf_counter() - gt0
+        if len(generations) < M_ROLLOUTS:
+            rec["status"] = "gen_short"
+            return rec
+
+        rewards = [
+            env.compute_reward(problem, tokenizer.decode(g["tokens"][g["prompt_length"]:]))
+            for g in generations
+        ]
+        n_success = sum(1 for r in rewards if r >= args.success_threshold)
+        mean = sum(rewards) / len(rewards)
+        rec.update({
+            "problem_id": problem["id"],
+            "generate_s": round(generate_s, 3),
+            "rewards": [round(r, 4) for r in rewards],
+            "mean_reward": round(mean, 4),
+            "n_success": n_success,
+            "zone_band": [args.zone_low, zone_high],
+        })
+
+        if not (args.zone_low <= n_success <= zone_high):
+            rec["status"] = "out_of_zone"
+            if key_id in remaining_key_ids:
+                remaining_key_ids.remove(key_id)
+                _rewrite_key_ids(args.key_ids, remaining_key_ids, key_container)
+                rec["removed_from_key_ids"] = True
+            logger.info("key %d -> id %d: OUT_OF_ZONE %d/%d — removed, next",
+                        key_id, selected, n_success, M_ROLLOUTS)
+            return rec
+
+        # in-zone -> build GRAIL submissions + submit
+        rollout_subs = [
+            engine._build_rollout_submission(g, problem, randomness, env=env)
+            for g in generations
+        ]
+        merkle_root = _compute_merkle_root(rollout_subs)
+        current_round = _current_drand_round_at_send()
+        nonce = os.urandom(16).hex()
+        env_sig = sign_envelope(
+            wallet=wallet, miner_hotkey=wallet.hotkey.ss58_address,
+            window_start=window_n, prompt_idx=selected, merkle_root=merkle_root,
+            checkpoint_hash=local_hash, drand_round=current_round,
+            randomness=randomness, nonce=nonce,
+        ).hex()
+        request = BatchSubmissionRequest(
+            miner_hotkey=wallet.hotkey.ss58_address, prompt_idx=selected,
+            window_start=window_n, merkle_root=merkle_root, rollouts=rollout_subs,
+            checkpoint_hash=local_hash, drand_round=current_round,
+            nonce=nonce, envelope_signature=env_sig,
+        )
+        try:
+            resp = await submit_batch_v2(args.validator_url, request, client=client)
+            accepted = bool(resp.accepted)
+            reason = resp.reason.value if hasattr(resp.reason, "value") else str(resp.reason)
+        except SubmissionError as exc:
+            accepted, reason = False, f"submit_error:{exc}"
+
+        rec["submitted"] = True
+        rec["submit_accepted"] = accepted
+        rec["submit_reason"] = reason
+        if accepted:
+            rec["status"] = "submit_accepted"
+            if key_id in remaining_key_ids:
+                remaining_key_ids.remove(key_id)
+                _rewrite_key_ids(args.key_ids, remaining_key_ids, key_container)
+                rec["removed_from_key_ids"] = True
+            logger.info("key %d -> id %d: SUBMIT ACCEPTED — removed from %s",
+                        key_id, selected, args.key_ids)
+        else:
+            rec["status"] = "submit_failed"
+            logger.info("key %d -> id %d: SUBMIT FAILED (%s) — kept, next",
+                        key_id, selected, reason)
+        return rec
+
+    def _emit(window_n, lo, hi, n_cooldown, randomness):
+        select_times = [r["select_s"] for r in records if "select_s" in r]
+        total_select_s = sum(select_times)
+        result = {
+            "meta": {
+                "checkpoint": f"{state.checkpoint_repo_id}@{local_hash[:12]}",
+                "device": "cuda:0", "env": env_fqn, "n_rollouts": M_ROLLOUTS,
+                "max_new_tokens": args.max_new_tokens, "window_n": window_n,
+                "window_slice": [lo, hi], "live_cooldown_ids": n_cooldown,
+                "submit": True, "loop": args.loop,
+                "miner_hotkey": wallet.hotkey.ss58_address,
+                "randomness": randomness, "key_ids": len(key_ids),
+                "windows_processed": len({r.get("window_n") for r in records if "window_n" in r}),
+            },
+            "timings": {
+                "model_load_s": round(model_load_s, 3),
+                "env_load_s": round(env_load_s, 3),
+                "group_load_s": round(group_load_s, 3),
+                "total_select_s": round(total_select_s, 4),
+                "mean_select_s": round(total_select_s / len(select_times), 6) if select_times else 0.0,
+            },
+            "selections": records,
+        }
+        _emit_outputs(args, result)
+
+    # ----------------------------------------------------- window loop
+    last_window = -1
+    stop = False
     async with httpx.AsyncClient(timeout=120) as client:
-        for key_id in key_ids:
-            rec, selected = _select_candidate(
-                env_fqn, key_id, id2group, group_ids, live_cooldown, lo, hi, args.candidate,
-            )
-            if selected is None:
-                records.append(rec)
-                logger.info("key %d: %s — next", key_id, rec["status"])
-                continue
-
-            problem = env.get_problem(selected)
-            gt0 = time.perf_counter()
-            generations = engine._generate_m_rollouts(problem, randomness)
-            generate_s = time.perf_counter() - gt0
-            if len(generations) < M_ROLLOUTS:
-                rec["status"] = "gen_short"
-                records.append(rec)
-                continue
-
-            rewards = [
-                env.compute_reward(problem, tokenizer.decode(g["tokens"][g["prompt_length"]:]))
-                for g in generations
-            ]
-            n_success = sum(1 for r in rewards if r >= args.success_threshold)
-            mean = sum(rewards) / len(rewards)
-            rec.update({
-                "problem_id": problem["id"],
-                "generate_s": round(generate_s, 3),
-                "rewards": [round(r, 4) for r in rewards],
-                "mean_reward": round(mean, 4),
-                "n_success": n_success,
-                "zone_band": [args.zone_low, zone_high],
-            })
-
-            if not (args.zone_low <= n_success <= zone_high):
-                rec["status"] = "out_of_zone"
-                if key_id in remaining_key_ids:
-                    remaining_key_ids.remove(key_id)
-                    _rewrite_key_ids(args.key_ids, remaining_key_ids, key_container)
-                    rec["removed_from_key_ids"] = True
-                logger.info("key %d -> id %d: OUT_OF_ZONE %d/%d — removed, next",
-                            key_id, selected, n_success, M_ROLLOUTS)
-                records.append(rec)
-                continue
-
-            # in-zone -> build GRAIL submissions + submit
-            rollout_subs = [
-                engine._build_rollout_submission(g, problem, randomness, env=env)
-                for g in generations
-            ]
-            merkle_root = _compute_merkle_root(rollout_subs)
-            current_round = _current_drand_round_at_send()
-            nonce = os.urandom(16).hex()
-            env_sig = sign_envelope(
-                wallet=wallet, miner_hotkey=wallet.hotkey.ss58_address,
-                window_start=window_n, prompt_idx=selected, merkle_root=merkle_root,
-                checkpoint_hash=local_hash, drand_round=current_round,
-                randomness=randomness, nonce=nonce,
-            ).hex()
-            request = BatchSubmissionRequest(
-                miner_hotkey=wallet.hotkey.ss58_address, prompt_idx=selected,
-                window_start=window_n, merkle_root=merkle_root, rollouts=rollout_subs,
-                checkpoint_hash=local_hash, drand_round=current_round,
-                nonce=nonce, envelope_signature=env_sig,
-            )
+        while not stop:
             try:
-                resp = await submit_batch_v2(args.validator_url, request, client=client)
-                accepted = bool(resp.accepted)
-                reason = resp.reason.value if hasattr(resp.reason, "value") else str(resp.reason)
-            except SubmissionError as exc:
-                accepted, reason = False, f"submit_error:{exc}"
+                st = await get_window_state_v2(args.validator_url, env=env_fqn, client=client)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("state fetch failed (%s); retrying in %.0fs",
+                               e, args.poll_interval)
+                await asyncio.sleep(args.poll_interval)
+                continue
 
-            rec["submitted"] = True
-            rec["submit_accepted"] = accepted
-            rec["submit_reason"] = reason
-            if accepted:
-                rec["status"] = "submit_accepted"
-                if key_id in remaining_key_ids:
-                    remaining_key_ids.remove(key_id)
-                    _rewrite_key_ids(args.key_ids, remaining_key_ids, key_container)
-                    rec["removed_from_key_ids"] = True
-                logger.info("key %d -> id %d: SUBMIT ACCEPTED — removed from %s",
-                            key_id, selected, args.key_ids)
-            else:
-                rec["status"] = "submit_failed"
-                logger.info("key %d -> id %d: SUBMIT FAILED (%s) — kept, next",
-                            key_id, selected, reason)
-            records.append(rec)
+            # keep proof/gen models in lock-step with the validator checkpoint
+            try:
+                local_n, local_hash, _ = await maybe_pull_checkpoint(
+                    state=st, local_n=local_n, local_hash=local_hash,
+                    local_model=engine.hf_model,
+                    download_fn=_hf_download, load_fn=engine._load_checkpoint,
+                )
+            except Exception:
+                logger.exception("checkpoint pull failed; keeping current models")
 
-    select_times = [r["select_s"] for r in records if "select_s" in r]
-    total_select_s = sum(select_times)
-    result = {
-        "meta": {
-            "checkpoint": f"{state.checkpoint_repo_id}@{local_hash[:12]}",
-            "device": "cuda:0", "env": env_fqn, "n_rollouts": M_ROLLOUTS,
-            "max_new_tokens": args.max_new_tokens, "window_n": window_n,
-            "window_slice": [lo, hi], "live_cooldown_ids": len(live_cooldown),
-            "submit": True, "miner_hotkey": wallet.hotkey.ss58_address,
-            "randomness": randomness, "key_ids": len(key_ids),
-        },
-        "timings": {
-            "model_load_s": round(model_load_s, 3),
-            "env_load_s": round(env_load_s, 3),
-            "group_load_s": round(group_load_s, 3),
-            "total_select_s": round(total_select_s, 4),
-            "mean_select_s": round(total_select_s / len(select_times), 6) if select_times else 0.0,
-        },
-        "selections": records,
-    }
-    _emit_outputs(args, result)
+            randomness = st.randomness or args.randomness or ""
+            if not randomness or st.window_n == last_window:
+                logger.info("waiting for new window (cur=%s, have_randomness=%s, "
+                            "remaining_keys=%d)...",
+                            st.window_n, bool(randomness), len(remaining_key_ids))
+                await asyncio.sleep(args.poll_interval)
+                continue
+
+            # --- NEW WINDOW ---
+            last_window = st.window_n
+            window_n = st.window_n
+            live_cooldown = {int(x) for x in st.cooldown_prompts}
+            lo, hi = window_prompt_range(randomness, env_fqn, universe_n, PROMPT_RANGE_SIZE)
+            keys_this_window = [k for k in remaining_key_ids if k not in dead_keys]
+            if args.max_key_ids > 0:
+                keys_this_window = keys_this_window[: args.max_key_ids]
+            logger.info("=== window %d slice [%d,%d) cooldown=%d keys=%d ===",
+                        window_n, lo, hi, len(live_cooldown), len(keys_this_window))
+
+            for key_id in keys_this_window:
+                rec = await _process_key(
+                    key_id, lo, hi, live_cooldown, window_n, local_hash, randomness, client,
+                )
+                if rec.get("status") == "no_group":
+                    dead_keys.add(key_id)
+                records.append(rec)
+
+            _emit(window_n, lo, hi, len(live_cooldown), randomness)
+
+            if not args.loop:
+                stop = True
+            elif not remaining_key_ids:
+                logger.info("key_id.json empty — all keys resolved; stopping")
+                stop = True
 
 
 def main() -> None:
@@ -513,6 +569,13 @@ def main() -> None:
     p.add_argument("--hotkey", default="default", help="Bittensor hotkey name")
     p.add_argument("--wallet-path", default=os.getenv("BT_WALLET_PATH", ""),
                    help="Optional wallet base path")
+    p.add_argument("--loop", action="store_true",
+                   help="Keep running: after walking the current window's key ids, "
+                        "wait for the next validator window (new randomness/cooldown) "
+                        "and walk the remaining key ids again. Stops on Ctrl-C or when "
+                        "key_id.json is empty.")
+    p.add_argument("--poll-interval", type=float, default=30.0,
+                   help="Seconds between /state polls while waiting for a new window")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -530,6 +593,10 @@ def main() -> None:
         import asyncio
         asyncio.run(_run_submit(args, env_fqn))
         return
+
+    if args.loop:
+        logger.warning("--loop only applies in --submit mode; ignoring for the "
+                       "offline (non-submit) run.")
 
     # --- key ids ---
     key_ids = _load_ids(args.key_ids)
