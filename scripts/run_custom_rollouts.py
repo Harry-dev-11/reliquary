@@ -285,6 +285,12 @@ def main() -> None:
     parser.add_argument("--env", choices=["openmath", "opencode", "both"],
                         default="both",
                         help="Which environment(s) to run (default: both)")
+    parser.add_argument("--openmath-data", default="",
+                        help="Local OpenMath dataset path (save_to_disk dir, "
+                             "parquet dir, or .parquet file). Overrides the HF download.")
+    parser.add_argument("--opencode-data", default="",
+                        help="Local OpenCode dataset path (save_to_disk dir). "
+                             "Overrides the HF download.")
     parser.add_argument("--n-rollouts", type=int, default=4,
                         help="Rollouts to generate per prompt id (default: 4)")
     parser.add_argument("--max-new-tokens", type=int, default=1024,
@@ -302,6 +308,15 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # Point the environments at local datasets you downloaded, if given. These
+    # env vars are read when each Environment is constructed in _process_env.
+    if args.openmath_data:
+        os.environ["RELIQUARY_OMI_REPO"] = args.openmath_data
+        logger.info("OpenMath dataset source: %s (local)", args.openmath_data)
+    if args.opencode_data:
+        os.environ["RELIQUARY_OCI_REPO"] = args.opencode_data
+        logger.info("OpenCode dataset source: %s (local)", args.opencode_data)
 
     openmath_ids = _load_ids(args.openmath) if args.env in ("openmath", "both") else []
     opencode_ids = _load_ids(args.opencode) if args.env in ("opencode", "both") else []

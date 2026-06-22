@@ -285,23 +285,51 @@ class OpenMathInstructEnvironment:
 
     def __init__(self) -> None:
         if OpenMathInstructEnvironment._dataset_cache is None:
-            import datasets as hf
-            n_shards = int(os.environ.get("RELIQUARY_OMI_SHARDS", str(self._DEFAULT_SHARDS)))
-            n_shards = max(1, min(n_shards, 32))
-            # Load only the first N shards by passing explicit data_files
-            # verification_mode="no_checks" skips the metadata-mandated config
-            # split set ({train_1M, train_2M, train_5M}) so we can pull
-            # arbitrary parquet shards directly.
-            data_files = [
-                f"data/train-{i:05d}-of-00032.parquet" for i in range(n_shards)
-            ]
-            OpenMathInstructEnvironment._dataset_cache = hf.load_dataset(
-                "nvidia/OpenMathInstruct-2",
-                data_files=data_files,
-                split="train",
-                verification_mode="no_checks",
-            )
+            OpenMathInstructEnvironment._dataset_cache = self._load_dataset()
         self._dataset = OpenMathInstructEnvironment._dataset_cache
+
+    @classmethod
+    def _load_dataset(cls):
+        """Load the dataset, preferring a local copy when one is configured.
+
+        ``RELIQUARY_OMI_REPO`` may point at a local path you already
+        downloaded: a ``save_to_disk`` directory (has ``dataset_info.json``),
+        a directory of ``*.parquet`` shards, or a single parquet file. If it
+        is not a local path it is treated as an HF hub repo id and the first
+        N shards are pulled (``RELIQUARY_OMI_SHARDS``). The default remains the
+        nvidia hub dataset. Local data must keep the ``problem`` /
+        ``expected_answer`` columns so get_problem emits identical prompts.
+        """
+        import datasets as hf
+
+        repo = os.environ.get("RELIQUARY_OMI_REPO", "nvidia/OpenMathInstruct-2")
+        local = os.path.expanduser(repo)
+        if os.path.exists(local):
+            if os.path.exists(os.path.join(local, "dataset_info.json")):
+                return hf.load_from_disk(local)
+            if os.path.isdir(local):
+                import glob
+                files = sorted(glob.glob(os.path.join(local, "*.parquet")))
+                if files:
+                    return hf.load_dataset("parquet", data_files=files, split="train")
+            elif os.path.isfile(local):
+                return hf.load_dataset("parquet", data_files=local, split="train")
+
+        n_shards = int(os.environ.get("RELIQUARY_OMI_SHARDS", str(cls._DEFAULT_SHARDS)))
+        n_shards = max(1, min(n_shards, 32))
+        # Load only the first N shards by passing explicit data_files
+        # verification_mode="no_checks" skips the metadata-mandated config
+        # split set ({train_1M, train_2M, train_5M}) so we can pull
+        # arbitrary parquet shards directly.
+        data_files = [
+            f"data/train-{i:05d}-of-00032.parquet" for i in range(n_shards)
+        ]
+        return hf.load_dataset(
+            repo,
+            data_files=data_files,
+            split="train",
+            verification_mode="no_checks",
+        )
 
     def __len__(self) -> int:
         return len(self._dataset)

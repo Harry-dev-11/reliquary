@@ -12,3 +12,6 @@ wallet_deploy/
 
 # Local Claude Code state
 .claude/
+
+# Oversized data source — split into group.part1/2.json for GitHub
+group.json
