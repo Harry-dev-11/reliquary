@@ -198,6 +198,12 @@ def mine(
     ),
     zone_low: int = typer.Option(2, help="In-zone if #reward-1 rollouts >= this"),
     zone_high: int = typer.Option(6, help="In-zone if #reward-1 rollouts <= this"),
+    max_new_tokens: int = typer.Option(
+        2048,
+        help="Max completion tokens per rollout (protocol cap is 8192). Lower = "
+             "much faster: batched generation runs until ALL 8 rollouts hit EOS or "
+             "this cap, so one runaway rollout otherwise drags the batch to 8192.",
+    ),
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
     """Run Reliquary miner."""
@@ -360,6 +366,7 @@ def mine(
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
             group_selector=group_selector,
+            max_new_tokens=max_new_tokens,
         )
 
         # Seed engine's _loaded_checkpoint_path so the first

@@ -157,16 +157,19 @@ class GroupSelector:
                 self._dead.add(key_id)
                 continue
             members = self.group_ids.get(gid, [])
+            # selection pool = OTHER in-slice, non-cooldown members (never key id).
+            # Compute against the slice first (cheap, in-memory); only touch disk
+            # for the key we actually select — writing candidate.json for every
+            # examined key was the hot-loop I/O cost.
             candidates = [i for i in members if i not in live_cooldown]
-            if self.candidate_path:
-                with open(self.candidate_path, "w") as f:
-                    json.dump({"key_id": key_id, "group_id": gid,
-                               "ids": sorted(candidates)}, f)
-            # selection pool = OTHER in-slice, non-cooldown members (never key id)
             accepted = [i for i in candidates if lo <= i < hi and i != key_id]
             if not accepted:
                 self._skip_window.add(key_id)
                 continue
+            if self.candidate_path:
+                with open(self.candidate_path, "w") as f:
+                    json.dump({"key_id": key_id, "group_id": gid,
+                               "ids": sorted(candidates)}, f)
             return key_id, min(accepted), gid
         return None
 
