@@ -19,7 +19,12 @@ out. The flow per key id:
   5. generate N rollouts for the selected accepted id and score them. The group
      is IN-ZONE (trainable) when the count of reward-1 rollouts is in
      [zone_low, zone_high] (default 2..6 of 8 — not too hard, not too easy).
-     Outside that band it's OUT_OF_ZONE -> back to step 2.
+     OUT_OF_ZONE -> remove the key id from key_id.json -> back to step 2.
+  6. (--submit only) for an in-zone group, build GRAIL proofs + merkle + signed
+     envelope and POST /submit to the live validator. On a verdict of accepted,
+     remove the key id from key_id.json; on failure, keep it and go to step 2.
+     Needs a registered wallet + the validator's current checkpoint (loaded into
+     a generation model and a proof model) + M_ROLLOUTS=8 rollouts.
 
 This mirrors the protocol's three real constraints (group/cooldown, window slice,
 trainable variance) without any GRAIL/submission. It is self-contained: it adds
@@ -183,6 +188,282 @@ def _fetch_window_state(
     return randomness, window_n, (lo, hi), cooldown_ids
 
 
+def _select_candidate(
+    env_fqn: str, key_id: int, id2group: dict[int, int],
+    group_ids: dict[int, list[int]], live_cooldown: set[int],
+    lo: int, hi: int, candidate_path: str,
+) -> tuple[dict, "int | None"]:
+    """Steps 2-4: key id -> group -> candidates (minus live cooldown) ->
+    candidate.json -> window-slice intersection -> select ONE other candidate.
+
+    Returns (record, selected_id). selected_id is None when the key id has no
+    group or no other candidate landed in the slice (record.status is set).
+    Times only the selection work into record["select_s"].
+    """
+    rec: dict[str, Any] = {"env": env_fqn, "key_id": key_id}
+    sel_t0 = time.perf_counter()
+
+    gid = id2group.get(key_id)
+    if gid is None:
+        rec["status"] = "no_group"
+        rec["select_s"] = round(time.perf_counter() - sel_t0, 6)
+        return rec, None
+    rec["group_id"] = gid
+
+    members = group_ids.get(gid, [])
+    candidates = [i for i in members if i not in live_cooldown]
+    rec["group_size"] = len(members)
+    rec["cooldown_in_group"] = sum(1 for i in members if i in live_cooldown)
+    rec["candidates"] = len(candidates)
+
+    with open(candidate_path, "w") as f:
+        json.dump({"key_id": key_id, "group_id": gid, "ids": sorted(candidates)}, f)
+
+    # Selection pool = OTHER in-slice, non-cooldown group members (never key id).
+    accepted = [i for i in candidates if lo <= i < hi and i != key_id]
+    rec["accepted_in_slice"] = len(accepted)
+    if not accepted:
+        rec["status"] = "no_accepted_in_slice"
+        rec["select_s"] = round(time.perf_counter() - sel_t0, 6)
+        return rec, None
+
+    selected = min(accepted)
+    rec["selected_id"] = selected
+    rec["select_s"] = round(time.perf_counter() - sel_t0, 6)
+    return rec, selected
+
+
+async def _run_submit(args, env_fqn: str) -> None:
+    """Real-validator submission path (step 6).
+
+    Loads the validator's CURRENT checkpoint into both a generation model and a
+    proof model, builds a MiningEngine, and for each in-zone selection produces
+    M_ROLLOUTS GRAIL-proven rollouts, signs the envelope, POSTs /submit, and
+    reads the accepted/reason verdict. key_id is removed from key_id.json on a
+    verdict of accepted (and on OUT_OF_ZONE); kept on submit failure.
+    """
+    import httpx
+    import torch
+    import bittensor as bt
+    from huggingface_hub import snapshot_download
+
+    from reliquary.constants import (
+        ATTN_IMPLEMENTATION, M_ROLLOUTS, PROMPT_RANGE_SIZE,
+    )
+    from reliquary.environment import load_environment
+    from reliquary.miner.engine import (
+        MiningEngine, _compute_merkle_root, _current_drand_round_at_send,
+    )
+    from reliquary.miner.submitter import (
+        SubmissionError, get_window_state_v2, submit_batch_v2,
+    )
+    from reliquary.protocol.signatures import sign_envelope
+    from reliquary.protocol.submission import BatchSubmissionRequest
+    from reliquary.shared.modeling import (
+        MODEL_SNAPSHOT_ALLOW_PATTERNS, load_text_generation_model, load_tokenizer,
+    )
+    from reliquary.shared.prompt_range import window_prompt_range
+
+    if not args.validator_url:
+        raise SystemExit("--submit requires --validator-url")
+
+    # --- key ids + group index ---
+    key_ids = _load_ids(args.key_ids)
+    key_container = _key_container(args.key_ids)
+    if args.max_key_ids > 0:
+        key_ids = key_ids[: args.max_key_ids]
+    if not key_ids:
+        raise SystemExit(f"{args.key_ids} is empty")
+    remaining_key_ids = _load_ids(args.key_ids)
+
+    group_paths = [g for g in args.group if os.path.exists(g)]
+    if not group_paths and os.path.exists("group.json"):
+        group_paths = ["group.json"]
+    if not group_paths:
+        raise SystemExit(f"no group file found (looked for {args.group} and group.json)")
+    t0 = time.perf_counter()
+    id2group, group_ids = _build_group_index(group_paths)
+    group_load_s = time.perf_counter() - t0
+    logger.info("loaded %d groups (%d ids) from %s in %.2fs",
+                len(group_ids), len(id2group), group_paths, group_load_s)
+
+    # --- wallet ---
+    wkw = {"name": args.wallet_name, "hotkey": args.hotkey}
+    if args.wallet_path:
+        wkw["path"] = args.wallet_path
+    wallet = bt.Wallet(**wkw)
+    logger.info("wallet hotkey: %s", wallet.hotkey.ss58_address)
+
+    # --- live state (randomness + cooldown + checkpoint identity) ---
+    async with httpx.AsyncClient(timeout=60) as client:
+        state = await get_window_state_v2(args.validator_url, env=env_fqn, client=client)
+    if not (state.checkpoint_repo_id and state.checkpoint_revision):
+        raise SystemExit("validator has no published checkpoint; cannot build a "
+                         "matching GRAIL proof — submit aborted")
+    randomness = state.randomness or args.randomness
+    if not randomness:
+        raise SystemExit("window randomness empty (window not OPEN yet); retry shortly")
+    local_hash = state.checkpoint_revision
+    window_n = state.window_n
+    live_cooldown = {int(x) for x in state.cooldown_prompts}
+
+    # grader for opencode rewards (zone check)
+    if args.env == "opencode":
+        from reliquary.cli.main import _ensure_grader_running
+        _ensure_grader_running()
+
+    # --- load BOTH models from the validator's checkpoint ---
+    t0 = time.perf_counter()
+    ckpt_path = snapshot_download(repo_id=state.checkpoint_repo_id,
+                                  revision=state.checkpoint_revision,
+                                  allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS)
+    tokenizer = load_tokenizer(ckpt_path)
+    proof_device = "cuda:1" if torch.cuda.device_count() >= 2 else "cuda:0"
+    vllm_model = load_text_generation_model(
+        ckpt_path, torch_dtype=torch.bfloat16, attn_implementation=ATTN_IMPLEMENTATION,
+    ).to("cuda:0").eval()
+    hf_model = load_text_generation_model(
+        ckpt_path, torch_dtype=torch.bfloat16, attn_implementation=ATTN_IMPLEMENTATION,
+    ).to(proof_device).eval()
+    model_load_s = time.perf_counter() - t0
+    logger.info("loaded checkpoint %s@%s (gen=cuda:0 proof=%s) in %.2fs",
+                state.checkpoint_repo_id, local_hash[:12], proof_device, model_load_s)
+
+    t0 = time.perf_counter()
+    env = load_environment(env_fqn)
+    env_load_s = time.perf_counter() - t0
+    universe_n = len(env)
+
+    engine = MiningEngine(
+        vllm_model, hf_model, tokenizer, wallet,
+        envs={env_fqn: env}, mix=[(env_fqn, 1)],
+        proof_gpu=0 if proof_device == "cuda:0" else 1,
+        max_new_tokens=args.max_new_tokens,
+        validator_url_override=args.validator_url,
+    )
+
+    if id2group and max(id2group) >= universe_n:
+        logger.warning("DATASET TOO SMALL: max group id %d >= len(env)=%d — ids "
+                       "wrap/never land in-slice.", max(id2group), universe_n)
+
+    lo, hi = window_prompt_range(randomness, env_fqn, universe_n, PROMPT_RANGE_SIZE)
+    logger.info("window %d slice [%d,%d) cooldown_ids=%d (randomness=%s...)",
+                window_n, lo, hi, len(live_cooldown), randomness[:12])
+
+    zone_high = min(args.zone_high, M_ROLLOUTS)
+    records: list[dict] = []
+    async with httpx.AsyncClient(timeout=120) as client:
+        for key_id in key_ids:
+            rec, selected = _select_candidate(
+                env_fqn, key_id, id2group, group_ids, live_cooldown, lo, hi, args.candidate,
+            )
+            if selected is None:
+                records.append(rec)
+                logger.info("key %d: %s — next", key_id, rec["status"])
+                continue
+
+            problem = env.get_problem(selected)
+            gt0 = time.perf_counter()
+            generations = engine._generate_m_rollouts(problem, randomness)
+            generate_s = time.perf_counter() - gt0
+            if len(generations) < M_ROLLOUTS:
+                rec["status"] = "gen_short"
+                records.append(rec)
+                continue
+
+            rewards = [
+                env.compute_reward(problem, tokenizer.decode(g["tokens"][g["prompt_length"]:]))
+                for g in generations
+            ]
+            n_success = sum(1 for r in rewards if r >= args.success_threshold)
+            mean = sum(rewards) / len(rewards)
+            rec.update({
+                "problem_id": problem["id"],
+                "generate_s": round(generate_s, 3),
+                "rewards": [round(r, 4) for r in rewards],
+                "mean_reward": round(mean, 4),
+                "n_success": n_success,
+                "zone_band": [args.zone_low, zone_high],
+            })
+
+            if not (args.zone_low <= n_success <= zone_high):
+                rec["status"] = "out_of_zone"
+                if key_id in remaining_key_ids:
+                    remaining_key_ids.remove(key_id)
+                    _rewrite_key_ids(args.key_ids, remaining_key_ids, key_container)
+                    rec["removed_from_key_ids"] = True
+                logger.info("key %d -> id %d: OUT_OF_ZONE %d/%d — removed, next",
+                            key_id, selected, n_success, M_ROLLOUTS)
+                records.append(rec)
+                continue
+
+            # in-zone -> build GRAIL submissions + submit
+            rollout_subs = [
+                engine._build_rollout_submission(g, problem, randomness, env=env)
+                for g in generations
+            ]
+            merkle_root = _compute_merkle_root(rollout_subs)
+            current_round = _current_drand_round_at_send()
+            nonce = os.urandom(16).hex()
+            env_sig = sign_envelope(
+                wallet=wallet, miner_hotkey=wallet.hotkey.ss58_address,
+                window_start=window_n, prompt_idx=selected, merkle_root=merkle_root,
+                checkpoint_hash=local_hash, drand_round=current_round,
+                randomness=randomness, nonce=nonce,
+            ).hex()
+            request = BatchSubmissionRequest(
+                miner_hotkey=wallet.hotkey.ss58_address, prompt_idx=selected,
+                window_start=window_n, merkle_root=merkle_root, rollouts=rollout_subs,
+                checkpoint_hash=local_hash, drand_round=current_round,
+                nonce=nonce, envelope_signature=env_sig,
+            )
+            try:
+                resp = await submit_batch_v2(args.validator_url, request, client=client)
+                accepted = bool(resp.accepted)
+                reason = resp.reason.value if hasattr(resp.reason, "value") else str(resp.reason)
+            except SubmissionError as exc:
+                accepted, reason = False, f"submit_error:{exc}"
+
+            rec["submitted"] = True
+            rec["submit_accepted"] = accepted
+            rec["submit_reason"] = reason
+            if accepted:
+                rec["status"] = "submit_accepted"
+                if key_id in remaining_key_ids:
+                    remaining_key_ids.remove(key_id)
+                    _rewrite_key_ids(args.key_ids, remaining_key_ids, key_container)
+                    rec["removed_from_key_ids"] = True
+                logger.info("key %d -> id %d: SUBMIT ACCEPTED — removed from %s",
+                            key_id, selected, args.key_ids)
+            else:
+                rec["status"] = "submit_failed"
+                logger.info("key %d -> id %d: SUBMIT FAILED (%s) — kept, next",
+                            key_id, selected, reason)
+            records.append(rec)
+
+    select_times = [r["select_s"] for r in records if "select_s" in r]
+    total_select_s = sum(select_times)
+    result = {
+        "meta": {
+            "checkpoint": f"{state.checkpoint_repo_id}@{local_hash[:12]}",
+            "device": "cuda:0", "env": env_fqn, "n_rollouts": M_ROLLOUTS,
+            "max_new_tokens": args.max_new_tokens, "window_n": window_n,
+            "window_slice": [lo, hi], "live_cooldown_ids": len(live_cooldown),
+            "submit": True, "miner_hotkey": wallet.hotkey.ss58_address,
+            "randomness": randomness, "key_ids": len(key_ids),
+        },
+        "timings": {
+            "model_load_s": round(model_load_s, 3),
+            "env_load_s": round(env_load_s, 3),
+            "group_load_s": round(group_load_s, 3),
+            "total_select_s": round(total_select_s, 4),
+            "mean_select_s": round(total_select_s / len(select_times), 6) if select_times else 0.0,
+        },
+        "selections": records,
+    }
+    _emit_outputs(args, result)
+
+
 def main() -> None:
     from reliquary.constants import ATTN_IMPLEMENTATION, DEFAULT_BASE_MODEL
 
@@ -222,6 +503,16 @@ def main() -> None:
     p.add_argument("--out", default="group_pipeline_result.json")
     p.add_argument("--md", default="group_pipeline_result.md")
     p.add_argument("--log-level", default="INFO")
+    # --- real validator submission (step 6) ---
+    p.add_argument("--submit", action="store_true",
+                   help="After an in-zone selection, build GRAIL proofs + submit "
+                        "to the live validator and read the accepted/reason verdict. "
+                        "Removes the key id from key_id.json on a verdict of accepted; "
+                        "keeps it on failure. Requires a registered wallet + validator-url.")
+    p.add_argument("--wallet-name", default="default", help="Bittensor wallet name")
+    p.add_argument("--hotkey", default="default", help="Bittensor hotkey name")
+    p.add_argument("--wallet-path", default=os.getenv("BT_WALLET_PATH", ""),
+                   help="Optional wallet base path")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -234,6 +525,11 @@ def main() -> None:
         os.environ["RELIQUARY_OMI_REPO"] = args.openmath_data
     if args.opencode_data:
         os.environ["RELIQUARY_OCI_REPO"] = args.opencode_data
+
+    if args.submit:
+        import asyncio
+        asyncio.run(_run_submit(args, env_fqn))
+        return
 
     # --- key ids ---
     key_ids = _load_ids(args.key_ids)
@@ -327,52 +623,15 @@ def main() -> None:
     # ------------------------------------------------------------------ walk
     records: list[dict] = []
     for key_id in key_ids:
-        rec: dict[str, Any] = {"env": env_fqn, "key_id": key_id}
-
-        # --- PROMPT-SELECTION timing: group lookup + cooldown filter +
-        #     candidate.json write + window-slice intersection + select. ---
-        sel_t0 = time.perf_counter()
-
-        gid = id2group.get(key_id)
-        if gid is None:
-            rec["status"] = "no_group"
-            rec["select_s"] = round(time.perf_counter() - sel_t0, 6)
+        rec, selected = _select_candidate(
+            env_fqn, key_id, id2group, group_ids, live_cooldown, lo, hi, args.candidate,
+        )
+        if selected is None:
             records.append(rec)
-            logger.info("key %d: no group — skip", key_id)
+            logger.info("key %d: %s — next", key_id, rec["status"])
             continue
-        rec["group_id"] = gid
-
-        members = group_ids.get(gid, [])
-        # cooldown = the validator's REAL cooldown set right now (live /state),
-        # intersected with this group's members.
-        candidates = [i for i in members if i not in live_cooldown]
-        rec["group_size"] = len(members)
-        rec["cooldown_in_group"] = sum(1 for i in members if i in live_cooldown)
-        rec["candidates"] = len(candidates)
-
-        # step 3: write candidate.json for this key id
-        with open(args.candidate, "w") as f:
-            json.dump({"key_id": key_id, "group_id": gid, "ids": sorted(candidates)}, f)
-
-        # step 4: window-slice intersection. The selection pool is the OTHER
-        # candidates in this group (in-slice, not cooldown) — never the key id
-        # itself; the key id only identifies which group to draw from.
-        accepted = [i for i in candidates if lo <= i < hi and i != key_id]
-        rec["accepted_in_slice"] = len(accepted)
-        if not accepted:
-            rec["status"] = "no_accepted_in_slice"
-            rec["select_s"] = round(time.perf_counter() - sel_t0, 6)
-            records.append(rec)
-            logger.info("key %d (group %d): %d candidates, 0 other in slice — next",
-                        key_id, gid, len(candidates))
-            continue
-
-        selected = min(accepted)
-        rec["selected_id"] = selected
-        select_s = time.perf_counter() - sel_t0
-        rec["select_s"] = round(select_s, 6)
         logger.info("key %d -> selected %d (group %d) in %.4fs (selection)",
-                    key_id, selected, gid, select_s)
+                    key_id, selected, rec["group_id"], rec["select_s"])
 
         # step 5: generate + score the group
         problem = env.get_problem(selected)
@@ -437,7 +696,7 @@ def main() -> None:
             "checkpoint": args.checkpoint, "device": device, "env": env_fqn,
             "n_rollouts": args.n_rollouts, "max_new_tokens": args.max_new_tokens,
             "window_n": window_n, "window_slice": [lo, hi],
-            "live_cooldown_ids": len(live_cooldown),
+            "live_cooldown_ids": len(live_cooldown), "submit": False,
             "randomness": randomness, "key_ids": len(key_ids),
         },
         "timings": {
@@ -449,25 +708,37 @@ def main() -> None:
         },
         "selections": records,
     }
+    _emit_outputs(args, result)
+
+
+def _emit_outputs(args, result: dict) -> None:
+    """Write the result json + markdown and print the stdout summary."""
+    records = result["selections"]
+    meta = result["meta"]
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
     _write_markdown(result, args.md)
 
-    # summary
     by_status: dict[str, int] = {}
     for r in records:
         by_status[r["status"]] = by_status.get(r["status"], 0) + 1
     print("\n" + "=" * 64)
-    print(f"env={env_fqn}  window={window_n}  slice=[{lo},{hi})  device={device}")
+    print(f"env={meta['env']}  window={meta['window_n']}  "
+          f"slice={meta['window_slice']}  device={meta['device']}"
+          + ("  [SUBMIT]" if meta.get("submit") else ""))
     print(f"key ids walked: {len(records)}")
-    print(f"prompt-selection time: total={total_select_s:.4f}s  "
-          f"mean={result['timings']['mean_select_s']:.6f}s/key")
+    print(f"prompt-selection time: total={result['timings'].get('total_select_s')}s  "
+          f"mean={result['timings'].get('mean_select_s')}s/key")
     for st, n in by_status.items():
         print(f"  {st:<22} {n}")
-    accepted_recs = [r for r in records if r["status"] == "accepted"]
+    accepted_recs = [r for r in records if r["status"] in ("accepted", "submit_accepted")]
     if accepted_recs:
-        m = sum(r["mean_reward"] for r in accepted_recs) / len(accepted_recs)
-        print(f"accepted selections: {len(accepted_recs)}  mean reward={m:.4f}")
+        m = sum(r.get("mean_reward", 0.0) for r in accepted_recs) / len(accepted_recs)
+        print(f"in-zone selections: {len(accepted_recs)}  mean reward={m:.4f}")
+    if meta.get("submit"):
+        subok = sum(1 for r in records if r["status"] == "submit_accepted")
+        subfail = sum(1 for r in records if r["status"] == "submit_failed")
+        print(f"submitted: accepted={subok}  failed={subfail}")
     print(f"\nwrote {args.out} and {args.md}")
     print("=" * 64)
 
@@ -507,21 +778,30 @@ def _write_markdown(result: dict, path: str) -> None:
         L.append(f"| {st} | {n} |")
     L.append("")
 
+    submitted_any = any(r.get("submitted") for r in recs)
     L.append("## Per key-id walk\n")
-    L.append("| key_id | group | grp_size | cooldown | cands | in_slice | "
-             "selected | status | reward-1 | mean | select_s | gen_s |")
-    L.append("|--:|--:|--:|--:|--:|--:|--:|---|--:|--:|--:|--:|")
+    header = ("| key_id | group | grp_size | cooldown | cands | in_slice | "
+              "selected | status | reward-1 | mean | select_s | gen_s |")
+    sep = "|--:|--:|--:|--:|--:|--:|--:|---|--:|--:|--:|--:|"
+    if submitted_any:
+        header = header + " submit_reason |"
+        sep = sep + "---|"
+    L.append(header)
+    L.append(sep)
     for r in recs:
         nsucc = r.get("n_success")
         band = r.get("zone_band")
         succ_cell = f"{nsucc} ({band[0]}..{band[1]})" if nsucc is not None and band else "-"
-        L.append(
+        row = (
             f"| {r['key_id']} | {r.get('group_id','-')} | {r.get('group_size','-')} | "
             f"{r.get('cooldown_in_group','-')} | {r.get('candidates','-')} | "
             f"{r.get('accepted_in_slice','-')} | {r.get('selected_id','-')} | "
             f"{r['status']} | {succ_cell} | {r.get('mean_reward','-')} | "
             f"{r.get('select_s','-')} | {r.get('generate_s','-')} |"
         )
+        if submitted_any:
+            row = row + f" {r.get('submit_reason','-')} |"
+        L.append(row)
     L.append("")
 
     acc = [r for r in recs if r["status"] == "accepted"]
