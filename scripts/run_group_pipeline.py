@@ -436,7 +436,8 @@ async def _run_submit(args, env_fqn: str) -> None:
                         key_id, selected, reason)
         return rec
 
-    def _emit(window_n, lo, hi, n_cooldown, randomness):
+    def _dump_json(window_n, lo, hi, n_cooldown, randomness):
+        """Write the FULL cumulative result.json (json can't be appended)."""
         select_times = [r["select_s"] for r in records if "select_s" in r]
         total_select_s = sum(select_times)
         result = {
@@ -459,7 +460,18 @@ async def _run_submit(args, env_fqn: str) -> None:
             },
             "selections": records,
         }
-        _emit_outputs(args, result)
+        with open(args.out, "w") as f:
+            json.dump(result, f, indent=2)
+
+    # markdown: write the run header once, then append a section per window.
+    _md_init(args.md, {
+        "checkpoint": f"{state.checkpoint_repo_id}@{local_hash[:12]}", "env": env_fqn,
+        "miner_hotkey": wallet.hotkey.ss58_address, "n_rollouts": M_ROLLOUTS,
+        "max_new_tokens": args.max_new_tokens, "zone_band": [args.zone_low, zone_high],
+    }, {
+        "model_load_s": round(model_load_s, 3), "env_load_s": round(env_load_s, 3),
+        "group_load_s": round(group_load_s, 3),
+    })
 
     # ----------------------------------------------------- window loop
     last_window = -1
@@ -500,9 +512,16 @@ async def _run_submit(args, env_fqn: str) -> None:
             keys_this_window = [k for k in remaining_key_ids if k not in dead_keys]
             if args.max_key_ids > 0:
                 keys_this_window = keys_this_window[: args.max_key_ids]
+
+            if not keys_this_window:
+                logger.info("no live key ids left (remaining are no_group/dead); stopping")
+                stop = True
+                continue
+
             logger.info("=== window %d slice [%d,%d) cooldown=%d keys=%d ===",
                         window_n, lo, hi, len(live_cooldown), len(keys_this_window))
 
+            window_records: list[dict] = []
             for key_id in keys_this_window:
                 rec = await _process_key(
                     key_id, lo, hi, live_cooldown, window_n, local_hash, randomness, client,
@@ -510,8 +529,16 @@ async def _run_submit(args, env_fqn: str) -> None:
                 if rec.get("status") == "no_group":
                     dead_keys.add(key_id)
                 records.append(rec)
+                window_records.append(rec)
 
-            _emit(window_n, lo, hi, len(live_cooldown), randomness)
+            # append this window's section to the md; rewrite full cumulative json
+            _md_append_window(args.md, window_n, lo, hi, len(live_cooldown), window_records)
+            _dump_json(window_n, lo, hi, len(live_cooldown), randomness)
+            wcounts: dict[str, int] = {}
+            for r in window_records:
+                wcounts[r["status"]] = wcounts.get(r["status"], 0) + 1
+            logger.info("window %d done: %s | appended to %s",
+                        window_n, wcounts, args.md)
 
             if not args.loop:
                 stop = True
@@ -808,6 +835,55 @@ def _emit_outputs(args, result: dict) -> None:
         print(f"submitted: accepted={subok}  failed={subfail}")
     print(f"\nwrote {args.out} and {args.md}")
     print("=" * 64)
+
+
+def _md_init(path: str, meta: dict, timings: dict) -> None:
+    """Create/truncate the markdown report with a run header. Called once at the
+    start of a --loop run; window sections are appended after each window."""
+    L = ["# Group pipeline results (live submit)\n", "## Run\n",
+         "| field | value |", "|---|---|",
+         f"| checkpoint | `{meta['checkpoint']}` |",
+         f"| env | {meta['env']} |",
+         f"| miner_hotkey | `{meta.get('miner_hotkey','-')}` |",
+         f"| rollouts / selection | {meta['n_rollouts']} |",
+         f"| max_new_tokens | {meta['max_new_tokens']} |",
+         f"| zone band | {meta.get('zone_band','-')} |",
+         "", "## Setup timings (seconds)\n",
+         "| stage | seconds |", "|---|--:|",
+         f"| model load / download | {timings['model_load_s']} |",
+         f"| dataset load | {timings['env_load_s']} |",
+         f"| group index load | {timings['group_load_s']} |",
+         "", "---", ""]
+    with open(path, "w") as f:
+        f.write("\n".join(L) + "\n")
+
+
+def _md_append_window(path: str, window_n: int, lo: int, hi: int,
+                      n_cooldown: int, window_records: list[dict]) -> None:
+    """Append one window's section (heading + per-key table + summary) to the
+    markdown file, preserving everything already written for earlier windows."""
+    L = [f"## Window {window_n} · slice [{lo}, {hi}) · live cooldown {n_cooldown}\n",
+         "| key_id | group | cands | in_slice | selected | status | reward-1 | "
+         "mean | select_s | gen_s | submit_reason |",
+         "|--:|--:|--:|--:|--:|---|--:|--:|--:|--:|---|"]
+    for r in window_records:
+        nsucc = r.get("n_success")
+        band = r.get("zone_band")
+        succ = f"{nsucc} ({band[0]}..{band[1]})" if nsucc is not None and band else "-"
+        L.append(
+            f"| {r['key_id']} | {r.get('group_id','-')} | {r.get('candidates','-')} | "
+            f"{r.get('accepted_in_slice','-')} | {r.get('selected_id','-')} | "
+            f"{r['status']} | {succ} | {r.get('mean_reward','-')} | "
+            f"{r.get('select_s','-')} | {r.get('generate_s','-')} | "
+            f"{r.get('submit_reason','-')} |"
+        )
+    counts: dict[str, int] = {}
+    for r in window_records:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    summary = " · ".join(f"{k}={v}" for k, v in counts.items()) or "(no keys)"
+    L += ["", f"**Window {window_n} outcome:** {summary}", "", "---", ""]
+    with open(path, "a") as f:
+        f.write("\n".join(L) + "\n")
 
 
 def _write_markdown(result: dict, path: str) -> None:
