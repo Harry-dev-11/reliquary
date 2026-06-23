@@ -134,6 +134,21 @@ def _build_group_index(
     return id2group, group_ids
 
 
+def _termination_status(tokens, prompt_length, eos_ids, cap):
+    """Local mirror of the validator's verify_termination (minus the p_stop
+    probability gate, which needs the GRAIL proof). A rollout terminates validly
+    if its last token is a stop token (natural_eos) or the full sequence reached
+    the protocol cap (cap_truncated); anything else is bad_termination — exactly
+    what the validator rejects with RejectReason.BAD_TERMINATION."""
+    if not tokens:
+        return "bad_termination"
+    if int(tokens[-1]) in eos_ids:
+        return "natural_eos"
+    if len(tokens) >= cap:
+        return "cap_truncated"
+    return "bad_termination"
+
+
 def _fetch_window_state(
     validator_url: str, env_fqn: str, universe_n: int, retries: int, fallback_randomness: str,
 ) -> tuple[str, int, tuple[int, int], set[int]]:
@@ -674,6 +689,13 @@ def main() -> None:
     model_load_s = time.perf_counter() - t0
     logger.info("model loaded on %s in %.2fs", device, model_load_s)
 
+    # For the offline validator-side termination verdict.
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP, MAX_TRUNCATED_PER_SUBMISSION
+    from reliquary.shared.modeling import resolve_eos_token_ids
+    eos_ids = resolve_eos_token_ids(model, tokenizer)
+    term_cap = MAX_NEW_TOKENS_PROTOCOL_CAP
+    max_trunc = MAX_TRUNCATED_PER_SUBMISSION
+
     # --- env ---
     from reliquary.environment import load_environment
     t0 = time.perf_counter()
@@ -735,12 +757,21 @@ def main() -> None:
         )
         rewards = []
         roll_recs = []
+        bad_term = 0
         for i, gen in enumerate(rollouts):
             completion = tokenizer.decode(gen["tokens"][gen["prompt_length"]:])
             r = env.compute_reward(problem, completion)
             rewards.append(r)
+            term = _termination_status(gen["tokens"], gen["prompt_length"], eos_ids, term_cap)
+            if term == "bad_termination":
+                bad_term += 1
             roll_recs.append({"index": i, "reward": r,
-                              "completion_tokens": len(gen["tokens"]) - gen["prompt_length"]})
+                              "completion_tokens": len(gen["tokens"]) - gen["prompt_length"],
+                              "termination": term})
+        # Validator-side termination verdict: the validator rejects the whole
+        # batch (BAD_TERMINATION) when more than MAX_TRUNCATED_PER_SUBMISSION
+        # rollouts fail to terminate naturally / at the cap.
+        would_reject_term = bad_term > max_trunc
         mean = sum(rewards) / len(rewards)
         var = sum((r - mean) ** 2 for r in rewards) / len(rewards)
         std = var ** 0.5
@@ -760,8 +791,16 @@ def main() -> None:
             "reward_std": round(std, 4),
             "n_success": n_success,
             "zone_band": [args.zone_low, zone_high],
+            "bad_termination": bad_term,
+            "term_verdict": "BAD_TERMINATION" if would_reject_term else "ok",
             "rollouts": roll_recs,
         })
+        if would_reject_term:
+            logger.warning(
+                "key %d -> id %d: %d/%d rollouts bad-terminated (> %d allowed) — "
+                "validator would reject this batch as BAD_TERMINATION; raise "
+                "--max-new-tokens", key_id, selected, bad_term, args.n_rollouts, max_trunc,
+            )
 
         if args.zone_low <= n_success <= zone_high:
             rec["status"] = "accepted"
@@ -924,8 +963,8 @@ def _write_markdown(result: dict, path: str) -> None:
     submitted_any = any(r.get("submitted") for r in recs)
     L.append("## Per key-id walk\n")
     header = ("| key_id | group | grp_size | cooldown | cands | in_slice | "
-              "selected | status | reward-1 | mean | select_s | gen_s |")
-    sep = "|--:|--:|--:|--:|--:|--:|--:|---|--:|--:|--:|--:|"
+              "selected | status | reward-1 | mean | term | select_s | gen_s |")
+    sep = "|--:|--:|--:|--:|--:|--:|--:|---|--:|--:|---|--:|--:|"
     if submitted_any:
         header = header + " submit_reason |"
         sep = sep + "---|"
@@ -935,12 +974,15 @@ def _write_markdown(result: dict, path: str) -> None:
         nsucc = r.get("n_success")
         band = r.get("zone_band")
         succ_cell = f"{nsucc} ({band[0]}..{band[1]})" if nsucc is not None and band else "-"
+        bt = r.get("bad_termination")
+        term_cell = (f"{r.get('term_verdict','-')} ({bt})" if bt is not None
+                     else r.get("term_verdict", "-"))
         row = (
             f"| {r['key_id']} | {r.get('group_id','-')} | {r.get('group_size','-')} | "
             f"{r.get('cooldown_in_group','-')} | {r.get('candidates','-')} | "
             f"{r.get('accepted_in_slice','-')} | {r.get('selected_id','-')} | "
             f"{r['status']} | {succ_cell} | {r.get('mean_reward','-')} | "
-            f"{r.get('select_s','-')} | {r.get('generate_s','-')} |"
+            f"{term_cell} | {r.get('select_s','-')} | {r.get('generate_s','-')} |"
         )
         if submitted_any:
             row = row + f" {r.get('submit_reason','-')} |"

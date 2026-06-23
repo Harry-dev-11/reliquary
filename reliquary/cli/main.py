@@ -199,10 +199,12 @@ def mine(
     zone_low: int = typer.Option(2, help="In-zone if #reward-1 rollouts >= this"),
     zone_high: int = typer.Option(6, help="In-zone if #reward-1 rollouts <= this"),
     max_new_tokens: int = typer.Option(
-        2048,
+        4096,
         help="Max completion tokens per rollout (protocol cap is 8192). Lower = "
-             "much faster: batched generation runs until ALL 8 rollouts hit EOS or "
-             "this cap, so one runaway rollout otherwise drags the batch to 8192.",
+             "faster (batched generation runs until ALL 8 rollouts hit EOS or this "
+             "cap) but risks BAD_TERMINATION on rollouts cut off before a natural "
+             "EOS. 4096 balances speed vs termination; raise to 8192 if you still "
+             "see BAD_TERMINATION verdicts.",
     ),
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
