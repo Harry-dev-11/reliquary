@@ -133,6 +133,19 @@ def _generate_n_rollouts(
     return rollouts, generate_s
 
 
+def _termination_status(tokens, eos_ids, cap):
+    """Local mirror of the validator's verify_termination (minus the p_stop gate,
+    which needs the GRAIL proof). natural_eos / cap_truncated are valid; anything
+    else is bad_termination — what the validator rejects as BAD_TERMINATION."""
+    if not tokens:
+        return "bad_termination"
+    if int(tokens[-1]) in eos_ids:
+        return "natural_eos"
+    if len(tokens) >= cap:
+        return "cap_truncated"
+    return "bad_termination"
+
+
 def _process_env(
     env_name: str,
     ids: list[int],
@@ -143,6 +156,8 @@ def _process_env(
 ) -> tuple[list[dict], float]:
     """Run all prompt ids for one environment. Returns (records, env_load_s)."""
     from reliquary.environment import load_environment
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP, MAX_TRUNCATED_PER_SUBMISSION
+    from reliquary.shared.modeling import resolve_eos_token_ids
 
     t0 = time.perf_counter()
     env = load_environment(env_name)  # triggers dataset download/load
@@ -150,6 +165,9 @@ def _process_env(
     logger.info("Loaded env %s (%d problems) in %.2fs", env_name, len(env), env_load_s)
 
     authoritative = bool(getattr(env, "validator_authoritative_reward", False))
+    eos_ids = resolve_eos_token_ids(model, tokenizer)
+    term_cap = MAX_NEW_TOKENS_PROTOCOL_CAP
+    max_trunc = MAX_TRUNCATED_PER_SUBMISSION
     records: list[dict] = []
 
     for pid in ids:
@@ -160,6 +178,7 @@ def _process_env(
 
         roll_records = []
         rewards = []
+        bad_term = 0
         for i, gen in enumerate(rollouts):
             completion_tokens = gen["tokens"][gen["prompt_length"] :]
             completion_text = tokenizer.decode(completion_tokens)
@@ -167,14 +186,22 @@ def _process_env(
             reward = env.compute_reward(problem, completion_text)
             reward_s = time.perf_counter() - rt0
             rewards.append(reward)
+            term = _termination_status(gen["tokens"], eos_ids, term_cap)
+            if term == "bad_termination":
+                bad_term += 1
             roll_records.append({
                 "index": i,
                 "reward": reward,
                 "completion_tokens": len(completion_tokens),
+                "termination": term,
                 "reward_s": round(reward_s, 4),
                 "completion_preview": completion_text[:200],
             })
 
+        # Validator-side termination verdict: the validator rejects the whole
+        # batch (BAD_TERMINATION) when more than MAX_TRUNCATED_PER_SUBMISSION
+        # rollouts fail to terminate naturally / at the cap.
+        would_reject_term = bad_term > max_trunc
         mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
         rec = {
             "env": env_name,
@@ -188,13 +215,21 @@ def _process_env(
             "generate_s": round(generate_s, 3),
             "per_rollout_gen_s": round(generate_s / n_rollouts, 3),
             "mean_reward": round(mean_reward, 4),
+            "bad_termination": bad_term,
+            "term_verdict": "BAD_TERMINATION" if would_reject_term else "ok",
             "rollouts": roll_records,
         }
         records.append(rec)
+        if would_reject_term:
+            logger.warning(
+                "%s id=%d: %d/%d rollouts bad-terminated (> %d) — validator would "
+                "reject as BAD_TERMINATION; raise --max-new-tokens",
+                env_name, pid, bad_term, n_rollouts, max_trunc,
+            )
         logger.info(
-            "%s id=%d: mean_reward=%.3f  gen=%.2fs (%.2fs/rollout)  rewards=%s",
+            "%s id=%d: mean_reward=%.3f  gen=%.2fs (%.2fs/rollout)  bad_term=%d  rewards=%s",
             env_name, pid, mean_reward, generate_s, generate_s / n_rollouts,
-            [round(r, 2) for r in rewards],
+            bad_term, [round(r, 2) for r in rewards],
         )
     return records, env_load_s
 
@@ -245,26 +280,30 @@ def _write_markdown(result: dict, path: str) -> None:
 
     # --- Per-prompt summary ---
     lines.append("## Per-prompt summary\n")
-    lines.append("| env | prompt_id | problem_id | mean_reward | rewards | gen_s | s/rollout |")
-    lines.append("|---|--:|---|--:|---|--:|--:|")
+    lines.append("| env | prompt_id | problem_id | mean_reward | rewards | term | gen_s | s/rollout |")
+    lines.append("|---|--:|---|--:|---|---|--:|--:|")
     for r in records:
         rewards = ", ".join(f"{ro['reward']:.2f}" for ro in r["rollouts"])
+        bt = r.get("bad_termination")
+        term_cell = (f"{r.get('term_verdict','-')} ({bt})" if bt is not None
+                     else r.get("term_verdict", "-"))
         lines.append(
             f"| {r['env']} | {r['prompt_id']} | `{r['problem_id']}` | "
-            f"{r['mean_reward']:.3f} | {rewards} | {r['generate_s']:.2f} | "
+            f"{r['mean_reward']:.3f} | {rewards} | {term_cell} | {r['generate_s']:.2f} | "
             f"{r['per_rollout_gen_s']:.2f} |"
         )
     lines.append("")
 
     # --- Per-rollout detail ---
     lines.append("## Per-rollout detail\n")
-    lines.append("| env | prompt_id | rollout | reward | tokens | reward_s |")
-    lines.append("|---|--:|--:|--:|--:|--:|")
+    lines.append("| env | prompt_id | rollout | reward | tokens | termination | reward_s |")
+    lines.append("|---|--:|--:|--:|--:|---|--:|")
     for r in records:
         for ro in r["rollouts"]:
             lines.append(
                 f"| {r['env']} | {r['prompt_id']} | {ro['index']} | "
-                f"{ro['reward']:.3f} | {ro['completion_tokens']} | {ro['reward_s']} |"
+                f"{ro['reward']:.3f} | {ro['completion_tokens']} | "
+                f"{ro.get('termination','-')} | {ro['reward_s']} |"
             )
     lines.append("")
 
@@ -402,17 +441,22 @@ def main() -> None:
     print(f"Total generation: {total_gen_s:.2f}s   "
           f"mean/prompt: {result['timings']['mean_generation_s_per_prompt']:.2f}s")
     print("-" * 72)
-    print(f"{'env':<18}{'id':>10}{'mean_rew':>10}{'gen_s':>8}{'s/roll':>8}")
+    print(f"{'env':<18}{'id':>10}{'mean_rew':>10}{'term':>16}{'gen_s':>8}{'s/roll':>8}")
     for r in all_records:
+        term = r.get("term_verdict", "ok")
+        if r.get("bad_termination"):
+            term = f"{term}({r['bad_termination']})"
         print(f"{r['env']:<18}{r['prompt_id']:>10}{r['mean_reward']:>10.3f}"
-              f"{r['generate_s']:>8.2f}{r['per_rollout_gen_s']:>8.2f}")
+              f"{term:>16}{r['generate_s']:>8.2f}{r['per_rollout_gen_s']:>8.2f}")
     by_env: dict[str, list[float]] = {}
     for r in all_records:
         by_env.setdefault(r["env"], []).append(r["mean_reward"])
+    n_bad = sum(1 for r in all_records if r.get("term_verdict") == "BAD_TERMINATION")
     print("-" * 72)
     for env_name, vals in by_env.items():
         print(f"{env_name}: overall mean reward = {sum(vals) / len(vals):.4f} "
               f"over {len(vals)} prompts")
+    print(f"BAD_TERMINATION (would be rejected by validator): {n_bad}/{len(all_records)} prompts")
     print(f"\nWrote full results to {args.out}")
     print(f"Wrote markdown report to {args.md}")
     print("=" * 72)
