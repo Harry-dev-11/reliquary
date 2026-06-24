@@ -30,6 +30,8 @@ app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Sub
 logger = logging.getLogger(__name__)
 
 _grader_proc: "subprocess.Popen | None" = None
+_DEFAULT_OPENMATH_CANDIDATES_FILE = "openmath.json"
+_DEFAULT_OPENCODE_CANDIDATES_FILE = "opencode.json"
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -227,14 +229,20 @@ def mine(
         ),
     ),
     openmath_candidates_file: str = typer.Option(
-        os.getenv("RELIQUARY_OPENMATH_CANDIDATES_FILE", ""),
+        os.getenv(
+            "RELIQUARY_OPENMATH_CANDIDATES_FILE",
+            _DEFAULT_OPENMATH_CANDIDATES_FILE,
+        ),
         help=(
             "Optional JSON file of preferred openmathinstruct prompt_idx values. "
             "Only live, in-range, non-cooldown IDs are used; otherwise the miner falls back."
         ),
     ),
     opencode_candidates_file: str = typer.Option(
-        os.getenv("RELIQUARY_OPENCODE_CANDIDATES_FILE", ""),
+        os.getenv(
+            "RELIQUARY_OPENCODE_CANDIDATES_FILE",
+            _DEFAULT_OPENCODE_CANDIDATES_FILE,
+        ),
         help=(
             "Optional JSON file of preferred opencodeinstruct prompt_idx values. "
             "Only live, in-range, non-cooldown IDs are used; otherwise the miner falls back."
@@ -354,6 +362,12 @@ def mine(
         }
         for env_name, candidate_file in candidate_files.items():
             if not candidate_file:
+                continue
+            if not Path(candidate_file).exists():
+                logger.info(
+                    "No candidate file for %s at %s; using default picker fallback",
+                    env_name, candidate_file,
+                )
                 continue
             candidate_indices = _load_candidate_prompt_indices(candidate_file)
             candidate_indices_per_env[env_name] = candidate_indices
