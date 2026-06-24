@@ -11,6 +11,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Iterable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import random as _random
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     from reliquary.environment.base import Environment
 
 logger = logging.getLogger(__name__)
+_TIME_MD_PATH = Path("time.md")
 
 
 async def maybe_pull_checkpoint(
@@ -54,17 +56,26 @@ async def maybe_pull_checkpoint(
     state.checkpoint_repo_id + state.checkpoint_revision identify the
     HF snapshot. download_fn/load_fn still injected for testability.
 
-    Returns ``(new_local_n, new_local_hash, new_model)``. If no update is
+    Returns ``(new_local_n, new_local_hash, new_model, download_s, load_s)``.
+    If no update is
     needed (remote ≤ local, or remote has no repo/revision yet), returns
     inputs unchanged.
     """
     if state.checkpoint_n <= local_n:
-        return local_n, local_hash, local_model
+        return local_n, local_hash, local_model, None, None
     if state.checkpoint_repo_id is None or state.checkpoint_revision is None:
-        return local_n, local_hash, local_model
+        return local_n, local_hash, local_model, None, None
+    started_at = time.perf_counter()
     local_path = await download_fn(state.checkpoint_repo_id, state.checkpoint_revision)
+    download_s = time.perf_counter() - started_at
+    load_started_at = time.perf_counter()
     new_model = load_fn(local_path)
-    return state.checkpoint_n, state.checkpoint_revision, new_model
+    load_s = time.perf_counter() - load_started_at
+    logger.info(
+        "timing ckpt_refresh window=? checkpoint_n=%d download=%.3fs load=%.3fs",
+        state.checkpoint_n, download_s, load_s,
+    )
+    return state.checkpoint_n, state.checkpoint_revision, new_model, download_s, load_s
 
 
 async def _hf_download(repo_id: str, revision: str) -> str:
@@ -291,6 +302,32 @@ def _current_drand_round_at_send() -> int:
     return compute_current_drand_round(time.time(), ci["genesis_time"], ci["period"])
 
 
+def _fmt_timing(value: float | None) -> str:
+    return "-" if value is None else f"{value:.3f}"
+
+
+def _append_time_markdown_row(row: dict[str, object]) -> None:
+    header = (
+        "| ts | window | env | prompt_idx | pick_s | generation_s | grail_s | "
+        "merkle_s | submit_s | total_s | ckpt_download_s | ckpt_load_s | accepted | reason |\n"
+    )
+    separator = (
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|\n"
+    )
+    if not _TIME_MD_PATH.exists():
+        _TIME_MD_PATH.write_text("# Submission Timings\n\n" + header + separator)
+    line = (
+        f"| {row['ts']} | {row['window']} | {row['env']} | {row['prompt_idx']} | "
+        f"{_fmt_timing(row.get('pick_s'))} | {_fmt_timing(row.get('generation_s'))} | "
+        f"{_fmt_timing(row.get('grail_s'))} | {_fmt_timing(row.get('merkle_s'))} | "
+        f"{_fmt_timing(row.get('submit_s'))} | {_fmt_timing(row.get('total_s'))} | "
+        f"{_fmt_timing(row.get('ckpt_download_s'))} | {_fmt_timing(row.get('ckpt_load_s'))} | "
+        f"{row['accepted']} | {row['reason']} |\n"
+    )
+    with _TIME_MD_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
 class MiningEngine:
     """Two-GPU mining: vLLM (GPU 0) for generation, HF (GPU 1) for proofs."""
 
@@ -384,6 +421,8 @@ class MiningEngine:
         local_hash = ""
         blocked_envs: set[str] = set()
         current_window_n: int | None = None
+        last_checkpoint_download_s: float | None = None
+        last_checkpoint_load_s: float | None = None
 
         async with httpx.AsyncClient(timeout=30) as client:
             while True:
@@ -400,7 +439,13 @@ class MiningEngine:
 
                 # Pull new checkpoint if needed (works at any state).
                 try:
-                    local_n, local_hash, self.hf_model = await maybe_pull_checkpoint(
+                    (
+                        local_n,
+                        local_hash,
+                        self.hf_model,
+                        last_checkpoint_download_s,
+                        last_checkpoint_load_s,
+                    ) = await maybe_pull_checkpoint(
                         state=state, local_n=local_n, local_hash=local_hash,
                         local_model=self.hf_model,
                         download_fn=_hf_download,
@@ -442,12 +487,14 @@ class MiningEngine:
                             state.cooldown_prompts
                         )
                 try:
+                    pick_started_at = time.perf_counter()
                     env_name, prompt_idx = pick_env_and_prompt(
                         self.envs, self.mix, self._cooldown_per_env, rng=rng,
                         randomness=randomness,
                         candidate_indices_per_env=self.candidate_indices_per_env,
                         blocked_envs=blocked_envs,
                     )
+                    pick_s = time.perf_counter() - pick_started_at
                 except RuntimeError:
                     if blocked_envs and len(blocked_envs) >= len(self.envs):
                         logger.info(
@@ -461,8 +508,19 @@ class MiningEngine:
                     continue
 
                 env = self.envs[env_name]
+                logger.info(
+                    "timing window=%d env=%s prompt=%d pick=%.3fs",
+                    state.window_n, env_name, prompt_idx, pick_s,
+                )
+                submission_started_at = time.perf_counter()
                 problem = env.get_problem(prompt_idx)
+                generation_started_at = time.perf_counter()
                 generations = self._generate_m_rollouts(problem, randomness)
+                generation_s = time.perf_counter() - generation_started_at
+                logger.info(
+                    "timing window=%d env=%s prompt=%d generate=%.3fs rollouts=%d",
+                    state.window_n, env_name, prompt_idx, generation_s, len(generations),
+                )
                 if len(generations) < M_ROLLOUTS:
                     logger.warning(
                         "generated %d/%d for prompt %d; skipping",
@@ -470,11 +528,19 @@ class MiningEngine:
                     )
                     continue
 
+                grail_started_at = time.perf_counter()
                 rollout_submissions = [
                     self._build_rollout_submission(gen, problem, randomness, env=env)
                     for gen in generations
                 ]
+                grail_s = time.perf_counter() - grail_started_at
+                logger.info(
+                    "timing window=%d env=%s prompt=%d grail=%.3fs rollouts=%d",
+                    state.window_n, env_name, prompt_idx, grail_s, len(rollout_submissions),
+                )
+                merkle_started_at = time.perf_counter()
                 merkle_root = _compute_merkle_root(rollout_submissions)
+                merkle_s = time.perf_counter() - merkle_started_at
 
                 # v2.3 design A': fetch the drand round just before the POST.
                 # The attached round determines the submission's chronological
@@ -513,12 +579,19 @@ class MiningEngine:
                     nonce=_nonce,
                     envelope_signature=_envelope_sig,
                 )
+                submit_started_at = time.perf_counter()
                 try:
                     resp = await submit_batch_v2(url, request, client=client)
+                    submit_s = time.perf_counter() - submit_started_at
+                    total_s = time.perf_counter() - submission_started_at
                     logger.info(
                         "submitted window=%d prompt=%d accepted=%s reason=%s",
                         state.window_n, prompt_idx, resp.accepted,
                         resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
+                    )
+                    logger.info(
+                        "timing window=%d env=%s prompt=%d merkle=%.3fs submit=%.3fs total=%.3fs",
+                        state.window_n, env_name, prompt_idx, merkle_s, submit_s, total_s,
                     )
                     if (not resp.accepted) and resp.reason == RejectReason.BATCH_FILLED:
                         blocked_envs.add(env_name)
@@ -526,6 +599,26 @@ class MiningEngine:
                             "env=%s batch-filled for window=%d; blocking env until next window",
                             env_name, state.window_n,
                         )
+                    _append_time_markdown_row(
+                        {
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                            "window": state.window_n,
+                            "env": env_name,
+                            "prompt_idx": prompt_idx,
+                            "pick_s": pick_s,
+                            "generation_s": generation_s,
+                            "grail_s": grail_s,
+                            "merkle_s": merkle_s,
+                            "submit_s": submit_s,
+                            "total_s": total_s,
+                            "ckpt_download_s": last_checkpoint_download_s,
+                            "ckpt_load_s": last_checkpoint_load_s,
+                            "accepted": str(resp.accepted),
+                            "reason": resp.reason.value if hasattr(resp.reason, "value") else str(resp.reason),
+                        }
+                    )
+                    last_checkpoint_download_s = None
+                    last_checkpoint_load_s = None
                     results.append(resp)
                 except SubmissionError as exc:
                     logger.error("submit failed: %s", exc)

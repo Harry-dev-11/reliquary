@@ -302,10 +302,15 @@ def mine(
                     url, state.checkpoint_n, state.checkpoint_repo_id,
                     state.checkpoint_revision[:12],
                 )
+                download_started_at = _time.perf_counter()
                 initial_path = snapshot_download(
                     repo_id=state.checkpoint_repo_id,
                     revision=state.checkpoint_revision,
                     allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
+                )
+                logger.info(
+                    "initial checkpoint download checkpoint_n=%d duration_s=%.3f",
+                    state.checkpoint_n, _time.perf_counter() - download_started_at,
                 )
                 logger.info("Using initial checkpoint path: %s", initial_path)
             else:
