@@ -136,3 +136,27 @@ def test_pick_env_and_prompt_uses_openmath_candidates_when_opencode_has_none():
     )
     assert env_name == "openmathinstruct"
     assert idx in {11, 12}
+
+
+def test_pick_env_and_prompt_skips_blocked_envs():
+    from reliquary.miner.engine import pick_env_and_prompt
+    envs = {
+        "openmathinstruct": _FakeEnv("openmathinstruct", 100),
+        "opencodeinstruct": _FakeEnv("opencodeinstruct", 100),
+    }
+    mix = [("openmathinstruct", 1), ("opencodeinstruct", 1)]
+    cooldown = {"openmathinstruct": set(), "opencodeinstruct": set()}
+    rng = random.Random(0)
+    env_name, idx = pick_env_and_prompt(
+        envs,
+        mix,
+        cooldown,
+        candidate_indices_per_env={
+            "openmathinstruct": (11, 12),
+            "opencodeinstruct": (21, 22),
+        },
+        blocked_envs={"opencodeinstruct"},
+        rng=rng,
+    )
+    assert env_name == "openmathinstruct"
+    assert idx in {11, 12}

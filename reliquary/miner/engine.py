@@ -174,6 +174,7 @@ def pick_env_and_prompt(
     cooldown_per_env: dict[str, set[int]],
     *,
     candidate_indices_per_env: dict[str, tuple[int, ...]] | None = None,
+    blocked_envs: set[str] | None = None,
     rng: _random.Random | None = None,
     max_attempts: int = 1000,
     randomness: str | None = None,
@@ -186,13 +187,16 @@ def pick_env_and_prompt(
     chosen env's slice is fully in cooldown.
     """
     rng = rng or _random
-    names = [n for n, _ in mix]
+    blocked_envs = blocked_envs or set()
+    names = [n for n, _ in mix if n not in blocked_envs]
     weights = [w for _, w in mix]
     if not names:
         raise RuntimeError("pick_env_and_prompt: empty mix")
 
     candidate_priority = ("opencodeinstruct", "openmathinstruct")
     for env_name in candidate_priority:
+        if env_name in blocked_envs:
+            continue
         if env_name not in envs:
             continue
         env = envs[env_name]
@@ -221,7 +225,7 @@ def pick_env_and_prompt(
 
     available = list(names)
     while available:
-        avail_weights = [weights[names.index(n)] for n in available]
+        avail_weights = [dict(mix)[n] for n in available]
         env_name = rng.choices(available, weights=avail_weights)[0]
         env = envs[env_name]
         prompt_range = None
@@ -359,7 +363,7 @@ class MiningEngine:
             get_window_state_v2, submit_batch_v2,
         )
         from reliquary.protocol.submission import (
-            BatchSubmissionRequest, WindowState,
+            BatchSubmissionRequest, RejectReason, WindowState,
         )
 
         # Resolve validator URL (once).
@@ -378,6 +382,8 @@ class MiningEngine:
         results = []
         local_n = 0
         local_hash = ""
+        blocked_envs: set[str] = set()
+        current_window_n: int | None = None
 
         async with httpx.AsyncClient(timeout=30) as client:
             while True:
@@ -402,6 +408,10 @@ class MiningEngine:
                     )
                 except Exception:
                     logger.exception("checkpoint pull failed; keeping local")
+
+                if current_window_n != state.window_n:
+                    current_window_n = state.window_n
+                    blocked_envs.clear()
 
                 if state.state != WindowState.OPEN:
                     await asyncio.sleep(1)
@@ -436,10 +446,18 @@ class MiningEngine:
                         self.envs, self.mix, self._cooldown_per_env, rng=rng,
                         randomness=randomness,
                         candidate_indices_per_env=self.candidate_indices_per_env,
+                        blocked_envs=blocked_envs,
                     )
                 except RuntimeError:
-                    logger.info("all envs fully in cooldown; sleeping")
-                    await asyncio.sleep(5)
+                    if blocked_envs and len(blocked_envs) >= len(self.envs):
+                        logger.info(
+                            "all envs batch-filled for window=%d; waiting for next window",
+                            state.window_n,
+                        )
+                        await asyncio.sleep(1)
+                    else:
+                        logger.info("all envs fully in cooldown; sleeping")
+                        await asyncio.sleep(5)
                     continue
 
                 env = self.envs[env_name]
@@ -502,6 +520,12 @@ class MiningEngine:
                         state.window_n, prompt_idx, resp.accepted,
                         resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                     )
+                    if (not resp.accepted) and resp.reason == RejectReason.BATCH_FILLED:
+                        blocked_envs.add(env_name)
+                        logger.info(
+                            "env=%s batch-filled for window=%d; blocking env until next window",
+                            env_name, state.window_n,
+                        )
                     results.append(resp)
                 except SubmissionError as exc:
                     logger.error("submit failed: %s", exc)
