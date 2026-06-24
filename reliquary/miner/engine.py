@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import random as _random
@@ -118,11 +119,61 @@ def pick_prompt_idx(
     return rng.choice(eligible)
 
 
+def _eligible_candidate_indices(
+    candidate_indices: Iterable[int],
+    *,
+    env_len: int,
+    cooldown_prompts: set[int],
+    prompt_range: tuple[int, int] | None = None,
+) -> list[int]:
+    """Filter operator-provided candidate indices against live validator rules."""
+    lo, hi = (0, env_len) if prompt_range is None else prompt_range
+    lo = max(0, lo)
+    hi = min(env_len, hi)
+    if hi <= lo:
+        return []
+
+    eligible: list[int] = []
+    seen: set[int] = set()
+    for idx in candidate_indices:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        if idx < lo or idx >= hi:
+            continue
+        if idx in cooldown_prompts:
+            continue
+        eligible.append(idx)
+    return eligible
+
+
+def pick_candidate_prompt_idx(
+    env,
+    cooldown_prompts: set[int],
+    candidate_indices: Iterable[int],
+    *,
+    rng: _random.Random | None = None,
+    prompt_range: tuple[int, int] | None = None,
+) -> int:
+    """Pick a prompt from operator-provided candidates after live filtering."""
+    rng = rng or _random
+    eligible = _eligible_candidate_indices(
+        candidate_indices,
+        env_len=len(env),
+        cooldown_prompts=cooldown_prompts,
+        prompt_range=prompt_range,
+    )
+    if not eligible:
+        raise RuntimeError("no eligible candidate prompt")
+    return rng.choice(eligible)
+
+
 def pick_env_and_prompt(
     envs: dict,
     mix: list[tuple[str, int]],
     cooldown_per_env: dict[str, set[int]],
     *,
+    candidate_indices_per_env: dict[str, tuple[int, ...]] | None = None,
     rng: _random.Random | None = None,
     max_attempts: int = 1000,
     randomness: str | None = None,
@@ -139,6 +190,34 @@ def pick_env_and_prompt(
     weights = [w for _, w in mix]
     if not names:
         raise RuntimeError("pick_env_and_prompt: empty mix")
+
+    candidate_priority = ("opencodeinstruct", "openmathinstruct")
+    for env_name in candidate_priority:
+        if env_name not in envs:
+            continue
+        env = envs[env_name]
+        prompt_range = None
+        if randomness:
+            env_label = getattr(env, "name", env_name)
+            prompt_range = window_prompt_range(
+                randomness, env_label, len(env), PROMPT_RANGE_SIZE,
+            )
+        candidates = ()
+        if candidate_indices_per_env is not None:
+            candidates = candidate_indices_per_env.get(env_name, ())
+        if not candidates:
+            continue
+        try:
+            idx = pick_candidate_prompt_idx(
+                env,
+                cooldown_per_env.get(env_name, set()),
+                candidates,
+                rng=rng,
+                prompt_range=prompt_range,
+            )
+            return env_name, idx
+        except RuntimeError:
+            continue
 
     available = list(names)
     while available:
@@ -221,6 +300,7 @@ class MiningEngine:
         *,
         envs: "dict[str, Environment] | None" = None,
         mix: "list[tuple[str, int]] | None" = None,
+        candidate_indices_per_env: "dict[str, tuple[int, ...]] | None" = None,
         vllm_gpu: int = 0,
         proof_gpu: int = 1,
         max_new_tokens: int = MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -244,6 +324,7 @@ class MiningEngine:
             self.envs = {env.name: env}
             self.mix = [(env.name, 1)]
             self.env = env
+        self.candidate_indices_per_env = candidate_indices_per_env or {}
         self._cooldown_per_env: dict[str, set[int]] = {n: set() for n in self.envs}
 
         # Lazy imports for heavy deps — keep module import cheap.
@@ -354,6 +435,7 @@ class MiningEngine:
                     env_name, prompt_idx = pick_env_and_prompt(
                         self.envs, self.mix, self._cooldown_per_env, rng=rng,
                         randomness=randomness,
+                        candidate_indices_per_env=self.candidate_indices_per_env,
                     )
                 except RuntimeError:
                     logger.info("all envs fully in cooldown; sleeping")

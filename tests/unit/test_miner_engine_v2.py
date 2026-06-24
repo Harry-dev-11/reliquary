@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from reliquary.miner.engine import pick_prompt_idx
+from reliquary.miner.engine import pick_candidate_prompt_idx, pick_prompt_idx
 from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
 
 
@@ -174,6 +174,19 @@ def test_pick_prompt_full_range_unchanged():
     for _ in range(50):
         idx = pick_prompt_idx(env, cooldown_prompts=set(), rng=rng)
         assert 0 <= idx < 100
+
+
+def test_pick_candidate_prompt_idx_respects_range_and_cooldown():
+    env = FakeEnv()
+    rng = random.Random(1)
+    idx = pick_candidate_prompt_idx(
+        env,
+        cooldown_prompts={22, 25},
+        candidate_indices=[10, 22, 25, 39, 60],
+        rng=rng,
+        prompt_range=(20, 40),
+    )
+    assert idx == 39
 
 
 def test_pick_env_and_prompt_confines_to_window():

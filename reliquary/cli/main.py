@@ -2,6 +2,7 @@
 
 import asyncio
 import atexit
+import json
 import logging
 import os
 import shutil
@@ -145,6 +146,52 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
     )
 
 
+def _extract_candidate_index(item) -> int | None:
+    if isinstance(item, bool):
+        return None
+    if isinstance(item, int):
+        return item if item >= 0 else None
+    if isinstance(item, str):
+        text = item.strip()
+        if text.isdigit():
+            return int(text)
+        return None
+    if isinstance(item, dict):
+        for key in ("prompt_idx", "prompt_id", "id", "index"):
+            if key in item:
+                return _extract_candidate_index(item[key])
+    return None
+
+
+def _load_candidate_prompt_indices(path: str) -> tuple[int, ...]:
+    raw = json.loads(Path(path).read_text())
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        items = None
+        for key in ("prompt_idxs", "prompt_idx", "candidate_ids", "candidates", "ids"):
+            if key in raw:
+                items = raw[key]
+                break
+        if not isinstance(items, list):
+            raise ValueError(
+                "candidate JSON must be a list or an object containing one of: "
+                "prompt_idxs, prompt_idx, candidate_ids, candidates, ids"
+            )
+    else:
+        raise ValueError("candidate JSON must be a list or object")
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in items:
+        idx = _extract_candidate_index(item)
+        if idx is None or idx in seen:
+            continue
+        seen.add(idx)
+        out.append(idx)
+    return tuple(out)
+
+
 def setup_logging(level: str = "INFO"):
     # ``%(threadName)s`` distinguishes the main asyncio loop from the
     # dedicated ``weight-setter`` thread (see ``validate`` below) when
@@ -177,6 +224,20 @@ def mine(
         help=(
             "Override the validator URL (otherwise discovered from the metagraph). "
             "Useful for local testing — e.g. http://127.0.0.1:8888"
+        ),
+    ),
+    openmath_candidates_file: str = typer.Option(
+        os.getenv("RELIQUARY_OPENMATH_CANDIDATES_FILE", ""),
+        help=(
+            "Optional JSON file of preferred openmathinstruct prompt_idx values. "
+            "Only live, in-range, non-cooldown IDs are used; otherwise the miner falls back."
+        ),
+    ),
+    opencode_candidates_file: str = typer.Option(
+        os.getenv("RELIQUARY_OPENCODE_CANDIDATES_FILE", ""),
+        help=(
+            "Optional JSON file of preferred opencodeinstruct prompt_idx values. "
+            "Only live, in-range, non-cooldown IDs are used; otherwise the miner falls back."
         ),
     ),
     log_level: str = typer.Option("INFO", help="Log level"),
@@ -281,6 +342,20 @@ def mine(
 
         envs = load_environments(env_names)
         mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in envs]
+        candidate_indices_per_env: dict[str, tuple[int, ...]] = {}
+        candidate_files = {
+            "openmathinstruct": openmath_candidates_file,
+            "opencodeinstruct": opencode_candidates_file,
+        }
+        for env_name, candidate_file in candidate_files.items():
+            if not candidate_file:
+                continue
+            candidate_indices = _load_candidate_prompt_indices(candidate_file)
+            candidate_indices_per_env[env_name] = candidate_indices
+            logger.info(
+                "Loaded %d candidate prompt_idx values for %s from %s",
+                len(candidate_indices), env_name, candidate_file,
+            )
         engine = MiningEngine(
             vllm_model,
             hf_model,
@@ -288,6 +363,7 @@ def mine(
             wallet,
             envs=envs,
             mix=mix,
+            candidate_indices_per_env=candidate_indices_per_env or None,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
         )
