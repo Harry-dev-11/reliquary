@@ -165,32 +165,49 @@ def _extract_candidate_index(item) -> int | None:
     return None
 
 
-def _load_candidate_prompt_indices(path: str) -> tuple[int, ...]:
-    raw = json.loads(Path(path).read_text())
-    if isinstance(raw, list):
-        items = raw
-    elif isinstance(raw, dict):
-        items = None
-        for key in ("prompt_idxs", "prompt_idx", "candidate_ids", "candidates", "ids"):
-            if key in raw:
-                items = raw[key]
-                break
-        if not isinstance(items, list):
-            raise ValueError(
-                "candidate JSON must be a list or an object containing one of: "
-                "prompt_idxs, prompt_idx, candidate_ids, candidates, ids"
-            )
-    else:
-        raise ValueError("candidate JSON must be a list or object")
-
-    out: list[int] = []
-    seen: set[int] = set()
-    for item in items:
-        idx = _extract_candidate_index(item)
-        if idx is None or idx in seen:
-            continue
+def _collect_candidate_indices(item, out: list[int], seen: set[int]) -> None:
+    idx = _extract_candidate_index(item)
+    if idx is not None and idx not in seen:
         seen.add(idx)
         out.append(idx)
+        return
+
+    if isinstance(item, list):
+        for child in item:
+            _collect_candidate_indices(child, out, seen)
+        return
+
+    if isinstance(item, dict):
+        preferred_keys = (
+            "prompt_idxs", "prompt_idx", "candidate_ids", "candidates", "ids",
+        )
+        used_preferred_key = False
+        for key in preferred_keys:
+            if key in item:
+                used_preferred_key = True
+                _collect_candidate_indices(item[key], out, seen)
+        if used_preferred_key:
+            return
+
+        # Be permissive with top-level maps such as {"123": {...}, "456": {...}}
+        # or nested score maps keyed by prompt index.
+        for key, value in item.items():
+            key_idx = _extract_candidate_index(key)
+            if key_idx is not None and key_idx not in seen:
+                seen.add(key_idx)
+                out.append(key_idx)
+            _collect_candidate_indices(value, out, seen)
+
+
+def _load_candidate_prompt_indices(path: str) -> tuple[int, ...]:
+    raw = json.loads(Path(path).read_text())
+    out: list[int] = []
+    seen: set[int] = set()
+    _collect_candidate_indices(raw, out, seen)
+    if not out:
+        raise ValueError(
+            "candidate JSON did not contain any usable prompt indices"
+        )
     return tuple(out)
 
 

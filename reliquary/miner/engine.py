@@ -542,6 +542,40 @@ class MiningEngine:
                 merkle_root = _compute_merkle_root(rollout_submissions)
                 merkle_s = time.perf_counter() - merkle_started_at
 
+                try:
+                    submit_state = await get_window_state_v2(url, client=client)
+                except SubmissionError:
+                    logger.info(
+                        "skip submit window=%d env=%s prompt=%d reason=state_unavailable",
+                        state.window_n, env_name, prompt_idx,
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+                except Exception as exc:
+                    logger.info(
+                        "skip submit window=%d env=%s prompt=%d reason=state_error err=%s",
+                        state.window_n, env_name, prompt_idx, exc,
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                if submit_state.state != WindowState.OPEN:
+                    logger.info(
+                        "skip submit window=%d env=%s prompt=%d reason=window_closed state=%s",
+                        state.window_n,
+                        env_name,
+                        prompt_idx,
+                        submit_state.state.value if hasattr(submit_state.state, "value") else submit_state.state,
+                    )
+                    await asyncio.sleep(1)
+                    continue
+                if submit_state.window_n != state.window_n:
+                    logger.info(
+                        "skip submit old_window=%d new_window=%d env=%s prompt=%d reason=window_changed",
+                        state.window_n, submit_state.window_n, env_name, prompt_idx,
+                    )
+                    continue
+
                 # v2.3 design A': fetch the drand round just before the POST.
                 # The attached round determines the submission's chronological
                 # slot at seal time. Miss this and the validator rejects with
