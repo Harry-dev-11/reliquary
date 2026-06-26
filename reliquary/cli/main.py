@@ -369,6 +369,18 @@ def mine(
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
         ).to(proof_device).eval()
+        logger.info(
+            "attention generation requested=%s config=%s text_config=%s",
+            ATTN_IMPLEMENTATION,
+            getattr(vllm_model.config, "_attn_implementation", None),
+            getattr(getattr(vllm_model.config, "text_config", None), "_attn_implementation", None),
+        )
+        logger.info(
+            "attention proof requested=%s config=%s text_config=%s",
+            ATTN_IMPLEMENTATION,
+            getattr(hf_model.config, "_attn_implementation", None),
+            getattr(getattr(hf_model.config, "text_config", None), "_attn_implementation", None),
+        )
 
         envs = load_environments(env_names)
         mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in envs]
